@@ -1,0 +1,29 @@
+[package]
+name = "agent-phone"
+version = "0.1.0"
+edition = "2021"
+description = "iPhone automation CLI for AI agents"
+license = "Apache-2.0"
+repository = "https://github.com/govijr/agent-phone"
+readme = "README.md"
+keywords = ["ios", "simulator", "automation", "agents", "cli"]
+categories = ["command-line-utilities", "development-tools::testing"]
+build = "build.rs"
+
+[[bin]]
+name = "agent-phone"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
