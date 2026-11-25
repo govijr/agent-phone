@@ -40,9 +40,6 @@ pub fn run(check_only: bool) -> Result<Outcome> {
     let current = env!("CARGO_PKG_VERSION").to_string();
     let exe = std::env::current_exe()?.canonicalize()?;
     let shown = exe.to_string_lossy();
-    if shown.contains("/Cellar/") {
-        bail!("agent-phone was installed with Homebrew; run `brew upgrade agent-phone`");
-    }
     if shown.contains("/target/") {
         bail!("this is a development build ({shown}); update with `git pull && cargo install --path .`");
     }

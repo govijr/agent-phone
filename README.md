@@ -27,12 +27,22 @@ agent-phone --device iphone click "General"
 
 ## Install
 
-Requirements: an Apple silicon Mac, Xcode (opened once) with an iOS simulator runtime, and Rust to build.
+Requirements: an Apple silicon Mac and Xcode (opened once) with an iOS simulator runtime.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/govijr/agent-phone/main/install.sh | sh
+```
+
+This downloads the latest release, checks its SHA-256, and puts `agent-phone` in `~/.local/bin` (set `AGENT_PHONE_INSTALL_DIR` for somewhere else, or `AGENT_PHONE_VERSION=v0.2.0` for a specific release).
+
+Or build it yourself, with Rust:
 
 ```sh
 git clone https://github.com/govijr/agent-phone && cd agent-phone
 cargo install --path .
 ```
+
+`agent-phone upgrade` installs the newest release over the current binary, after checking its SHA-256 (`--check` only looks).
 
 ## Commands
 
@@ -79,6 +89,12 @@ cargo install --path .
 | `audit` | Accessibility problems: missing labels, small tap targets, duplicate labels |
 | `record start [path]` / `record stop` | Record the screen to an MP4 |
 | `diff <baseline.png> [current.png] [--out diff.png]` | How much of the screen changed against a baseline, with the changes marked in red |
+| `stream [--port 7300]` | Watch the simulator live in your browser; click to tap, drag to swipe |
+| `perf [--app id]` | CPU and memory of an app, sampled over a few seconds |
+| `profile start [path] [--template time\|allocations\|leaks\|hitches…]` / `profile stop` | Record an Instruments trace of an app |
+| `confirm [id]` / `deny <id>` | Run or drop an action the policy held back (no id lists them) |
+| `config [show\|init]` | Show the merged `agent-phone.json` settings, or write a starter file |
+| `upgrade [--check]` | Install the newest release |
 | `batch [cmd…]` | Run commands in order, from arguments or one per line on stdin; stops at the first failure unless `--keep-going` |
 | `skills get` | Print the agent guide built into the binary |
 | `mcp` | Run as an MCP server over stdio |
@@ -91,6 +107,30 @@ cargo install --path .
 **Global flags:** `--device <name|udid>` (or `AGENT_PHONE_DEVICE`) picks a simulator when several are booted. `--json` prints `{"ok": true, ...}` or `{"ok": false, "error": ...}`. `--no-daemon` (or `AGENT_PHONE_NO_DAEMON=1`) runs the command in-process. `--dialogs accept|dismiss` (or `AGENT_PHONE_DIALOGS`) answers system alerts before each command, so permission prompts don't block an agent.
 
 **The daemon.** The first simulator command starts a background process for that device, which keeps the simulator connection open, so later commands take tens of milliseconds instead of a few hundred. It exits after 30 idle minutes (`AGENT_PHONE_DAEMON_IDLE` in seconds), and restarts itself when you rebuild agent-phone. `boot` and `shutdown` stop it. iPhone Mirroring commands don't use it.
+
+## Config and policy
+
+`agent-phone.json` in your project folder (or any parent), and `~/.agent-phone/config.json` for every project, set defaults and limit what agents may do. Project settings win; flags and environment variables win over both. `agent-phone config init` writes a starter file.
+
+```json
+{
+  "device": "iPhone 17 Pro",
+  "dialogs": "accept",
+  "policy": {
+    "allowApps": ["com.example.*"],
+    "confirm": true,
+    "deny": ["Delete Account"],
+    "humanConfirm": false
+  }
+}
+```
+
+- **`allowApps`**: the only apps `open` may launch and taps may land in (bundle IDs, `*` wildcards; app names on an iPhone). Links that would open other apps are refused.
+- **`confirm`**: taps on elements whose text has one of these words are held instead of sent. `true` uses the built-in list (buy, pay, order, subscribe, send, post, share, delete, remove, transfer, sign out, call…). The command fails with an id; `agent-phone confirm <id>` runs it and `deny <id>` drops it. Held actions expire after 10 minutes. **On a real iPhone the built-in list is on unless you set `"confirm": false`.**
+- **`deny`**: words that are always refused.
+- **`humanConfirm`**: `confirm` only works in an interactive terminal, so an agent can't approve its own actions.
+
+The policy covers taps, long presses, double-taps, `fill`, `check` and `uncheck`, whether they name an element or a point. It doesn't read what you `type` or which key you `press`.
 
 ## Real iPhone (iPhone Mirroring)
 
@@ -123,7 +163,8 @@ Or add it as an MCP server. Its tools are `snapshot`, `click`, `fill`, `type`, `
 
 - **Input** goes through SimulatorKit's HID client as Indigo touch, button and keyboard messages, the same path Simulator.app uses.
 - **The tree** comes from AccessibilityPlatformTranslation's `AXPTranslator`, fed by CoreSimulator's accessibility requests, so frames are in screen points.
-- **App lifecycle and screenshots** use `xcrun simctl`.
+- **Screenshots and the live stream** read the simulator's framebuffer (an IOSurface) directly, which takes tens of milliseconds; `simctl io screenshot` takes over a second and is only the fallback.
+- **App lifecycle, settings and recording** use `xcrun simctl`; profiling uses `xctrace`.
 
 The private frameworks are loaded at runtime from your Xcode, and every call goes through a small Objective-C shim (`native/shim.m`) so no Objective-C exception reaches Rust. Tested on Xcode 27.2 with iOS 27.2.
 
@@ -132,6 +173,7 @@ For iPhone Mirroring (`native/mirror.m`), the window is found by bundle ID, capt
 ## Roadmap
 
 - iPhone: tap and swipe without bringing the Mirroring window to the front
+- Pinch and rotate gestures, and picker wheels
 - Non-US keyboard layouts (other text falls back to paste today)
 
 ## License

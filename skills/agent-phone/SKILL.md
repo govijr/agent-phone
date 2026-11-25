@@ -50,6 +50,18 @@ Use this when the user asks for their own phone, not a simulator. It goes throug
 - `type` and `fill` paste through the Mac clipboard. Add `--keystrokes` if a field rejects pasting.
 - This is the user's real phone. Ask before anything that sends, buys, posts or deletes.
 
+## Policy
+
+A project may have an `agent-phone.json` that limits apps and holds risky taps (buy, send, delete…). On the user's real iPhone those taps are always held.
+
+- `held for confirmation: … run agent-phone confirm <id>`: stop and ask the user, naming what would happen. Only run `agent-phone confirm <id>` after they say yes; otherwise `agent-phone deny <id>`. Never confirm on your own.
+- `the policy doesn't allow` / `the policy denies`: don't work around it (for example by tapping coordinates). Tell the user.
+
+## Performance and watching
+
+- `agent-phone perf` samples the app's CPU and memory. `profile start` … `profile stop` records an Instruments trace for the user to open.
+- `agent-phone stream` prints a link where the user can watch (and tap) the simulator live. It keeps running, so start it in the background.
+
 ## When things fail
 
 - `is no longer on screen`: the screen changed. Run `snapshot` again and pick the new ref.
