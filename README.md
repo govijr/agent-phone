@@ -178,4 +178,4 @@ For iPhone Mirroring (`native/mirror.m`), the window is found by bundle ID, capt
 
 ## License
 
-Apache-2.0. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for idb and phone-harness (both MIT).
+MIT. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for idb and phone-harness (both MIT).
