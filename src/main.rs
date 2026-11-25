@@ -1,6 +1,7 @@
 //! agent-phone: iPhone automation CLI for AI agents.
 
 mod annotate;
+mod config;
 mod daemon;
 mod device;
 mod keys;
@@ -9,6 +10,8 @@ mod mirror;
 mod native;
 mod sim;
 mod snapshot;
+mod stream;
+mod upgrade;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -41,6 +44,10 @@ pub struct Cli {
     /// Answer system alerts (permission prompts) automatically before each command.
     #[arg(long, global = true, env = "AGENT_PHONE_DIALOGS")]
     dialogs: Option<DialogAnswer>,
+
+    /// Runs an action the policy held back (set by `agent-phone confirm`).
+    #[arg(long, global = true, hide = true)]
+    confirmed: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -244,6 +251,41 @@ enum Command {
         #[arg(default_value = "recording.mp4")]
         path: String,
     },
+    /// CPU and memory use of an app (the frontmost one by default), sampled over a few seconds.
+    Perf {
+        /// Bundle ID.
+        #[arg(long)]
+        app: Option<String>,
+        /// How many samples to take.
+        #[arg(long, default_value_t = 3)]
+        samples: u32,
+        /// Seconds between samples.
+        #[arg(long, default_value_t = 1.0)]
+        interval: f64,
+    },
+    /// Profile an app with Instruments: `profile start`, use the app, then `profile stop`.
+    Profile {
+        action: RecordAction,
+        #[arg(default_value = "profile.trace")]
+        path: String,
+        /// time, allocations, leaks, hitches, swiftui, network, energy, or any Instruments template name.
+        #[arg(long, default_value = "time")]
+        template: String,
+        /// Bundle ID; defaults to the frontmost app.
+        #[arg(long)]
+        app: Option<String>,
+    },
+    /// Watch the simulator live in a browser; click to tap, drag to swipe. Runs until Ctrl-C.
+    Stream {
+        #[arg(long, default_value_t = 7300)]
+        port: u16,
+        /// Frames per second, at most.
+        #[arg(long, default_value_t = 10.0)]
+        fps: f64,
+        /// JPEG quality, 0.1 to 1.
+        #[arg(long, default_value_t = 0.6)]
+        quality: f64,
+    },
     /// Compare a screenshot with the screen now (or with another screenshot).
     Diff {
         baseline: String,
@@ -255,6 +297,15 @@ enum Command {
         /// How much a colour channel must change (0-255) for a pixel to count.
         #[arg(long, default_value_t = 24)]
         threshold: u8,
+    },
+    /// Run an action the policy held for confirmation (or list the held ones).
+    Confirm { id: Option<String> },
+    /// Drop an action the policy held for confirmation.
+    Deny { id: String },
+    /// Show the settings from agent-phone.json files, or write a starter one here.
+    Config {
+        #[arg(default_value = "show")]
+        action: ConfigAction,
     },
     /// Find elements by role, text, label, id, placeholder or value, and optionally act on one.
     ///
@@ -322,6 +373,12 @@ enum Command {
         /// `get` (the default) prints it.
         #[arg(default_value = "get")]
         action: String,
+    },
+    /// Install the newest release from GitHub over this binary.
+    Upgrade {
+        /// Only say whether a newer release exists.
+        #[arg(long)]
+        check: bool,
     },
     /// Serve agent-phone as an MCP server over stdio.
     Mcp,
@@ -491,6 +548,12 @@ enum RecordAction {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
+enum ConfigAction {
+    Show,
+    Init,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
 enum DaemonAction {
     Status,
     Stop,
@@ -565,7 +628,74 @@ struct LocateOptions {
 
 const SIM_ONLY: &str = "is only available on a simulator; iPhone Mirroring can't do it";
 
+/// The policy for the command running now, and what to save if an action needs confirming.
+struct Guard {
+    policy: config::Policy,
+    args: Vec<String>,
+    device: Option<String>,
+    confirmed: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Pending {
+    id: String,
+    args: Vec<String>,
+    cwd: String,
+    device: Option<String>,
+    reason: String,
+    created: u64,
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn pending_dir() -> Result<std::path::PathBuf> {
+    let dir = snapshot::home()?.join("pending");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Held actions, newest last. Ones older than 10 minutes are dropped.
+fn pending_list() -> Result<Vec<Pending>> {
+    let mut list = Vec::new();
+    for entry in std::fs::read_dir(pending_dir()?)?.flatten() {
+        let Ok(p) = serde_json::from_slice::<Pending>(&std::fs::read(entry.path()).unwrap_or_default()) else { continue };
+        if now_secs().saturating_sub(p.created) > 600 {
+            let _ = std::fs::remove_file(entry.path());
+            continue;
+        }
+        list.push(p);
+    }
+    list.sort_by_key(|p| p.created);
+    Ok(list)
+}
+
+fn pending_get(id: &str) -> Result<Pending> {
+    pending_list()?
+        .into_iter()
+        .find(|p| p.id == id)
+        .with_context(|| format!("no held action {id} (they expire after 10 minutes). `agent-phone confirm` lists them"))
+}
+
+/// Strips `--confirmed <id>` from a command line.
+fn without_confirmed(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut skip = false;
+    for a in args {
+        if skip {
+            skip = false;
+        } else if a == "--confirmed" {
+            skip = true;
+        } else if !a.starts_with("--confirmed=") {
+            out.push(a.clone());
+        }
+    }
+    out
+}
+
 thread_local! {
+    static GUARD: RefCell<Option<Guard>> = const { RefCell::new(None) };
     /// Simulator connections, reused for the life of the process (the daemon, a batch, MCP).
     static PHONES: RefCell<HashMap<String, Rc<Phone>>> = RefCell::new(HashMap::new());
 }
@@ -680,7 +810,15 @@ impl Phone {
 
     fn screenshot(&self, path: &str) -> Result<()> {
         match &self.backend {
-            Backend::Sim { udid, .. } => device::screenshot(udid, path),
+            // Straight from the framebuffer (tens of milliseconds); simctl takes over a second.
+            Backend::Sim { udid, native } => {
+                let lower = path.to_lowercase();
+                let quality = if lower.ends_with(".jpg") || lower.ends_with(".jpeg") { 0.85 } else { 0.0 };
+                match native.frame(quality) {
+                    Ok(bytes) => std::fs::write(path, bytes).with_context(|| format!("could not write {path}")),
+                    Err(_) => device::screenshot(udid, path),
+                }
+            }
             Backend::Mirror(m) => m.borrow_mut().screenshot(path),
         }
     }
@@ -904,6 +1042,7 @@ impl Phone {
 
     fn click(&self, ctx: &Ctx, locator: &Locator, label: &str, hold: u32, force: bool) -> Result<()> {
         let (element, point) = self.locate(locator, LocateOptions { force, ..Default::default() })?;
+        self.guard(element.as_ref(), point, if hold >= 400 { "long-pressing" } else { "tapping" })?;
         self.touch(&[point], hold.max(30), 0)?;
         let verb = if hold >= 400 { "long-pressed" } else { "clicked" };
         ctx.done(format!("{verb} {}", target_label(&element, point, label)), element_json(&element, point));
@@ -912,6 +1051,7 @@ impl Phone {
 
     fn fill(&self, ctx: &Ctx, locator: &Locator, label: &str, text: &str, keystrokes: bool, force: bool) -> Result<()> {
         let (element, point) = self.locate(locator, LocateOptions { editable: true, force })?;
+        self.guard(element.as_ref(), point, "filling")?;
         self.touch(&[point], 30, 0)?;
         std::thread::sleep(Duration::from_millis(350));
         self.clear_field()?;
@@ -940,6 +1080,62 @@ impl Phone {
 }
 
 impl Phone {
+    /// Checks the policy before a tap on `element` (or whatever is at `point`). Refuses taps the
+    /// policy denies, and holds ones that need confirming until `agent-phone confirm`.
+    fn guard(&self, element: Option<&Element>, point: (f64, f64), action: &str) -> Result<()> {
+        let state = GUARD.with(|g| {
+            g.borrow().as_ref().map(|g| (g.policy.clone(), g.args.clone(), g.device.clone(), g.confirmed.clone()))
+        });
+        let Some((policy, args, device, confirmed)) = state else { return Ok(()) };
+        let words = policy.confirm_words(self.is_mirror());
+        if words.is_empty() && policy.deny.is_empty() && policy.allow_apps.is_empty() {
+            return Ok(());
+        }
+        let snapshot = if element.is_none() || !policy.allow_apps.is_empty() { Some(self.snapshot()?) } else { None };
+        if !policy.allow_apps.is_empty() && !self.is_mirror() {
+            if let Some(bundle) = snapshot.as_ref().and_then(|s| self.frontmost(s).ok().flatten()) {
+                if bundle != "com.apple.springboard" && !policy.app_allowed(&bundle) {
+                    bail!("the policy doesn't allow using {bundle} (allowApps in agent-phone.json)");
+                }
+            }
+        }
+        let found;
+        let element = match element {
+            Some(e) => Some(e),
+            None => {
+                found = snapshot.as_ref().and_then(|s| element_at(s, point)).cloned();
+                found.as_ref()
+            }
+        };
+        let Some(element) = element else { return Ok(()) };
+        let text = element.texts().collect::<Vec<_>>().join(" ");
+        if let Some(word) = config::matching_word(&text, &policy.deny) {
+            bail!("the policy denies {action} {} (it matches \"{word}\")", element.describe());
+        }
+        let Some(word) = config::matching_word(&text, &words) else { return Ok(()) };
+        if let Some(id) = confirmed {
+            if let Ok(p) = pending_get(&id) {
+                if p.args == without_confirmed(&args) {
+                    let _ = std::fs::remove_file(pending_dir()?.join(format!("{id}.json")));
+                    return Ok(());
+                }
+            }
+            bail!("confirmation {id} doesn't match this action");
+        }
+        let id = format!("{:06x}", (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos() & 0xff_ffff) as u32);
+        let reason = format!("{action} {} (it matches \"{word}\")", element.describe());
+        let pending = Pending {
+            id: id.clone(),
+            args: without_confirmed(&args),
+            cwd: std::env::current_dir()?.to_string_lossy().into_owned(),
+            device,
+            reason: reason.clone(),
+            created: now_secs(),
+        };
+        std::fs::write(pending_dir()?.join(format!("{id}.json")), serde_json::to_vec(&pending)?)?;
+        bail!("held for confirmation: {reason}. Ask the user, then run `agent-phone confirm {id}` (or `agent-phone deny {id}`)")
+    }
+
     fn springboard(&self) -> Option<i64> {
         *self.springboard.get_or_init(|| match &self.backend {
             Backend::Sim { udid, .. } => sim::springboard_pid(udid).ok().flatten(),
@@ -1035,6 +1231,7 @@ impl Phone {
         let locator = Locator::parse(target);
         let (element, point) = self.locate(&locator, LocateOptions::default())?;
         let element = element.context("give a switch, not a point")?;
+        self.guard(Some(&element), point, "switching")?;
         if !matches!(element.role.as_str(), "switch" | "checkbox" | "radio") && element.value.is_none() {
             bail!("{} is not a switch or checkbox", element.describe());
         }
@@ -1052,6 +1249,16 @@ impl Phone {
         }
         Ok(format!("turned {} {state}", element.describe()))
     }
+}
+
+/// The smallest element under a point, interactive ones first.
+fn element_at(snapshot: &Snapshot, (x, y): (f64, f64)) -> Option<&Element> {
+    let inside = |e: &&Element| x >= e.frame[0] && y >= e.frame[1] && x <= e.frame[0] + e.frame[2] && y <= e.frame[1] + e.frame[3];
+    let area = |e: &&Element| e.frame[2] * e.frame[3];
+    let smallest = |interactive: bool| {
+        snapshot.elements.iter().filter(|e| e.interactive == interactive).filter(inside).min_by(|a, b| area(a).total_cmp(&area(b)))
+    };
+    smallest(true).or_else(|| smallest(false))
 }
 
 /// Accessibility problems on the screen: unlabelled controls, small tap targets, duplicates.
@@ -1301,6 +1508,19 @@ fn run(ctx: &Ctx, cli: Cli) -> Result<()> {
             ctx.done(text, json!({ "apps": apps }));
         }
         Command::Open { target, fresh } => {
+            let policy = GUARD.with(|g| g.borrow().as_ref().map(|g| g.policy.clone())).unwrap_or_default();
+            if !policy.allow_apps.is_empty() {
+                let app = if target.starts_with("http://") || target.starts_with("https://") {
+                    "com.apple.mobilesafari"
+                } else if target.contains("://") {
+                    bail!("the policy limits which apps may be used, so links that open other apps are refused: {target}")
+                } else {
+                    target.as_str()
+                };
+                if !policy.app_allowed(app) {
+                    bail!("the policy doesn't allow opening {app} (allowApps in agent-phone.json)");
+                }
+            }
             let phone = ctx.phone()?;
             phone.open(&target, fresh)?;
             ctx.done(format!("opened {target}"), json!({ "target": target }));
@@ -1386,6 +1606,7 @@ fn run(ctx: &Ctx, cli: Cli) -> Result<()> {
         Command::Dblclick { target } => {
             let phone = ctx.phone()?;
             let (element, point) = phone.locate(&Locator::parse(&target), LocateOptions::default())?;
+            phone.guard(element.as_ref(), point, "double-tapping")?;
             phone.touch(&[point], 30, 0)?;
             std::thread::sleep(Duration::from_millis(70));
             phone.touch(&[point], 30, 0)?;
@@ -1641,6 +1862,67 @@ fn run(ctx: &Ctx, cli: Cli) -> Result<()> {
                 }
             }
         }
+        Command::Stream { port, fps, quality } => {
+            let phone = ctx.sim("stream")?;
+            stream::serve(&device::developer_dir()?, phone.sim().0, stream::Options { port, fps, quality: quality.clamp(0.1, 1.0) })?;
+        }
+        Command::Perf { app, samples, interval } => {
+            let phone = ctx.sim("perf")?;
+            let udid = phone.sim().0;
+            let (bundle, pid) = match app {
+                Some(app) => {
+                    let pid = sim::running(udid)?.into_iter().find(|r| r.bundle_id == app).with_context(|| format!("{app} is not running"))?.pid;
+                    (app, pid)
+                }
+                None => {
+                    let snapshot = phone.snapshot()?;
+                    let bundle = phone.frontmost(&snapshot)?.context("can't tell which app is in front")?;
+                    if bundle == "com.apple.springboard" {
+                        bail!("no app is open; pass --app");
+                    }
+                    (bundle, snapshot.pid.context("no process id")?)
+                }
+            };
+            let mut lines = Vec::new();
+            let mut rows = Vec::new();
+            let (mut last_cpu, mut last_at) = (sim::usage(pid)?.0, Instant::now());
+            for _ in 0..samples.max(1) {
+                std::thread::sleep(Duration::from_secs_f64(interval.max(0.1)));
+                let (cpu, rss) = sim::usage(pid)?;
+                let percent = (cpu - last_cpu) / last_at.elapsed().as_secs_f64() * 100.0;
+                (last_cpu, last_at) = (cpu, Instant::now());
+                let mb = rss as f64 / 1_048_576.0;
+                lines.push(format!("cpu {percent:5.1}%   memory {mb:6.1} MB"));
+                rows.push(json!({ "cpu_percent": percent, "memory_mb": mb }));
+            }
+            let avg = rows.iter().map(|r| r["cpu_percent"].as_f64().unwrap_or(0.0)).sum::<f64>() / rows.len() as f64;
+            let peak = rows.iter().map(|r| r["memory_mb"].as_f64().unwrap_or(0.0)).fold(0.0, f64::max);
+            ctx.done(
+                format!("{bundle} (pid {pid})\n{}\naverage cpu {avg:.1}%, peak memory {peak:.1} MB", lines.join("\n")),
+                json!({ "bundle_id": bundle, "pid": pid, "samples": rows, "average_cpu_percent": avg, "peak_memory_mb": peak }),
+            );
+        }
+        Command::Profile { action, path, template, app } => {
+            let phone = ctx.sim("profile")?;
+            let udid = phone.sim().0;
+            match action {
+                RecordAction::Start => {
+                    let bundle = match app {
+                        Some(a) => a,
+                        None => phone.frontmost_app("profile")?,
+                    };
+                    let process = sim::executable(udid, &bundle)?;
+                    let path = absolute(&path);
+                    let template = sim::template(&template);
+                    sim::profile_start(udid, &process, template, &path)?;
+                    ctx.done(format!("profiling {bundle} with {template}; use the app, then `agent-phone profile stop`"), json!({ "path": path, "template": template }));
+                }
+                RecordAction::Stop => {
+                    let path = sim::profile_stop(udid)?;
+                    ctx.done(format!("saved {path}; open it in Instruments with `open {path}`"), json!({ "path": path }));
+                }
+            }
+        }
         Command::Diff { baseline, current, out, threshold } => {
             let current = match current {
                 Some(c) => c,
@@ -1659,6 +1941,73 @@ fn run(ctx: &Ctx, cli: Cli) -> Result<()> {
                 None => summary,
             };
             ctx.done(text, json!({ "changed": ratio, "identical": ratio == 0.0, "out": out }));
+        }
+        Command::Confirm { id: None } => {
+            let list = pending_list()?;
+            let text = if list.is_empty() {
+                "nothing is waiting for confirmation".to_string()
+            } else {
+                list.iter().map(|p| format!("{}  {}\n        {}", p.id, p.reason, p.args[1..].join(" "))).collect::<Vec<_>>().join("\n")
+            };
+            let data: Vec<_> = list.iter().map(|p| json!({ "id": p.id, "reason": p.reason, "args": p.args })).collect();
+            ctx.done(text, json!({ "pending": data }));
+        }
+        Command::Confirm { id: Some(id) } => {
+            let pending = pending_get(&id)?;
+            let (config, _) = config::load()?;
+            if config.policy.is_some_and(|p| p.human_confirm) {
+                use std::io::{BufRead, IsTerminal, Write};
+                if !std::io::stdin().is_terminal() {
+                    bail!("the policy wants a person to confirm this: run `agent-phone confirm {id}` in a terminal");
+                }
+                eprint!("{}\nRun it? [y/N] ", pending.reason);
+                std::io::stderr().flush()?;
+                let mut answer = String::new();
+                std::io::stdin().lock().read_line(&mut answer)?;
+                if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                    let _ = std::fs::remove_file(pending_dir()?.join(format!("{id}.json")));
+                    bail!("not confirmed; dropped {id}");
+                }
+            }
+            let mut args = pending.args.clone();
+            args.splice(1..1, ["--confirmed".to_string(), id.clone()]);
+            if let Some(device) = &pending.device {
+                args.splice(1..1, ["--device".to_string(), device.clone()]);
+            }
+            std::env::set_current_dir(&pending.cwd).ok();
+            let out = dispatch(args);
+            ctx.out.borrow_mut().push_str(&out.stdout);
+            if out.code != 0 {
+                bail!("{}", out.stderr.trim().trim_start_matches("error: "));
+            }
+        }
+        Command::Deny { id } => {
+            pending_get(&id)?;
+            std::fs::remove_file(pending_dir()?.join(format!("{id}.json")))?;
+            ctx.done(format!("dropped {id}"), json!({ "id": id }));
+        }
+        Command::Config { action: ConfigAction::Show } => {
+            let (config, sources) = config::load()?;
+            let pretty = serde_json::to_string_pretty(&config)?;
+            let from = if sources.is_empty() {
+                "no config files (looked for ./agent-phone.json and its parents, and ~/.agent-phone/config.json)".to_string()
+            } else {
+                format!("from {}", sources.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "))
+            };
+            ctx.done(format!("{pretty}\n{from}"), json!({ "config": config, "sources": sources }));
+        }
+        Command::Config { action: ConfigAction::Init } => {
+            let path = std::path::Path::new("agent-phone.json");
+            if path.exists() {
+                bail!("agent-phone.json already exists here");
+            }
+            let starter = json!({
+                "device": "iPhone 17 Pro",
+                "dialogs": "accept",
+                "policy": { "allowApps": ["com.example.*"], "confirm": true, "deny": ["Delete Account"], "humanConfirm": false }
+            });
+            std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(&starter)?))?;
+            ctx.done("wrote agent-phone.json; edit the device and allowApps", json!({ "path": "agent-phone.json" }));
         }
         Command::Find { by, value, action, text, name, exact, nth, force } => {
             let phone = ctx.phone()?;
@@ -1835,7 +2184,7 @@ fn run(ctx: &Ctx, cli: Cli) -> Result<()> {
                 std::thread::sleep(Duration::from_millis(400));
             }
         }
-        Command::Screenshot { path, annotate } => {
+        Command::Screenshot { path, annotate, .. } => {
             let phone = ctx.phone()?;
             if !annotate {
                 phone.screenshot(&path)?;
@@ -1907,6 +2256,13 @@ fn run(ctx: &Ctx, cli: Cli) -> Result<()> {
             other => bail!("unknown skills action \"{other}\"; use `get` or `list`"),
         },
         Command::Mcp => mcp::serve()?,
+        Command::Upgrade { check } => match upgrade::run(check)? {
+            upgrade::Outcome::UpToDate(v) => ctx.done(format!("agent-phone {v} is the newest release"), json!({ "version": v, "upgraded": false })),
+            upgrade::Outcome::Available(v) => ctx.done(format!("{v} is available; run `agent-phone upgrade`"), json!({ "available": v })),
+            upgrade::Outcome::Upgraded { from, to, path } => {
+                ctx.done(format!("upgraded {} from {from} to {to}", path.display()), json!({ "from": from, "to": to, "upgraded": true }))
+            }
+        },
         Command::Daemon { action } => match action {
             DaemonAction::Status => {
                 let list = daemon::status();
@@ -1928,7 +2284,14 @@ fn run(ctx: &Ctx, cli: Cli) -> Result<()> {
 }
 
 /// Runs a parsed command in this process and returns what it printed.
-pub fn execute(cli: Cli) -> Output {
+pub fn execute(cli: Cli, args: &[String]) -> Output {
+    let policy = match config::load() {
+        Ok((config, _)) => config.policy.unwrap_or_default(),
+        Err(e) => return Output { stdout: String::new(), stderr: format!("error: {e:#}\n"), code: 1 },
+    };
+    GUARD.with(|g| {
+        *g.borrow_mut() = Some(Guard { policy, args: args.to_vec(), device: cli.device.clone(), confirmed: cli.confirmed.clone() })
+    });
     let ctx = Ctx { json: cli.json, device_arg: cli.device.clone(), dialogs: cli.dialogs, out: RefCell::new(String::new()), code: Cell::new(0) };
     match run(&ctx, cli) {
         Ok(()) => Output { stdout: ctx.out.take(), stderr: String::new(), code: ctx.code.get() },
@@ -1949,8 +2312,8 @@ pub fn execute(cli: Cli) -> Output {
 
 /// Parses and runs `args` (starting with the program name) in this process.
 pub fn execute_args(args: Vec<String>) -> Output {
-    match Cli::try_parse_from(args) {
-        Ok(cli) => execute(cli),
+    match Cli::try_parse_from(&args) {
+        Ok(cli) => execute(cli, &args),
         Err(e) => {
             let text = e.render().to_string();
             let code = e.exit_code();
@@ -1971,7 +2334,7 @@ fn dispatch(args: Vec<String>) -> Output {
                 return out;
             }
         }
-        return execute(cli);
+        return execute(cli, &args);
     }
     execute_args(args)
 }
@@ -2033,11 +2396,18 @@ fn emit(out: Output) -> ! {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    match config::load() {
+        Ok((config, _)) => config::apply_defaults(&config),
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            std::process::exit(1);
+        }
+    }
     let cli = Cli::parse();
     if cli.wants_daemon() {
-        if let Ok(out) = daemon::forward(&cli.with_env_flags(args), cli.device.as_deref()) {
+        if let Ok(out) = daemon::forward(&cli.with_env_flags(args.clone()), cli.device.as_deref()) {
             emit(out);
         }
     }
-    emit(execute(cli));
+    emit(execute(cli, &args));
 }

@@ -275,7 +275,7 @@ fn run_request(request: &Request) -> Output {
             if cli.device.is_none() {
                 cli.device = request.device.clone();
             }
-            let out = execute(cli);
+            let out = execute(cli, &request.args);
             if out.code != 0 {
                 forget_phones();
             }

@@ -138,6 +138,12 @@ const TOOLS: &[Tool] = &[
             p("lines", "integer", Flag, false, "At most this many lines (default 200)"),
         ],
     },
+    Tool {
+        name: "perf",
+        command: "perf",
+        about: "CPU and memory use of an app (the frontmost one unless app is given), sampled over a few seconds.",
+        params: &[p("app", "string", Flag, false, "Bundle ID"), p("samples", "integer", Flag, false, "Samples, one per second (default 3)")],
+    },
     Tool { name: "audit", command: "audit", about: "Accessibility problems on the screen: unlabelled controls, small tap targets, duplicate labels.", params: &[] },
     Tool {
         name: "find",

@@ -9,7 +9,7 @@ fn main() {
         .flag("-fobjc-arc")
         .flag("-Wno-unused-parameter")
         .compile("agentphone_shim");
-    for framework in ["Foundation", "CoreGraphics", "AppKit", "ApplicationServices", "ImageIO", "Vision", "CoreText"] {
+    for framework in ["Foundation", "CoreGraphics", "AppKit", "ApplicationServices", "ImageIO", "Vision", "CoreText", "IOSurface"] {
         println!("cargo:rustc-link-lib=framework={framework}");
     }
 }

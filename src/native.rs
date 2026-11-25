@@ -30,6 +30,7 @@ extern "C" {
         n: c_int,
         err: *mut *mut c_char,
     ) -> c_int;
+    fn ap_frame(dev_dir: *const c_char, udid: *const c_char, quality: c_double, len: *mut usize, err: *mut *mut c_char) -> *mut c_char;
     fn ap_free(s: *mut c_char);
 }
 
@@ -96,6 +97,19 @@ impl Target {
                 err,
             )
         })
+    }
+
+    /// The screen as image bytes: JPEG at `quality` (0-1), or PNG when `quality` is 0.
+    pub fn frame(&self, quality: f64) -> Result<Vec<u8>> {
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let mut len = 0usize;
+        let out = unsafe { ap_frame(self.dev_dir.as_ptr(), self.udid.as_ptr(), quality, &mut len, &mut err) };
+        if out.is_null() {
+            return Err(take_error(err));
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(out as *const u8, len) }.to_vec();
+        unsafe { ap_free(out) };
+        Ok(bytes)
     }
 
     fn string_call(&self, call: impl FnOnce(*mut *mut c_char) -> *mut c_char) -> Result<String> {

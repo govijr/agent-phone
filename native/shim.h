@@ -30,6 +30,10 @@ int ap_button(const char *dev_dir, const char *udid, int button, char **err);
 int ap_keys(const char *dev_dir, const char *udid, const uint32_t *usages,
             const uint8_t *directions, int n, char **err);
 
+// The screen as JPEG (quality 0-1) or PNG (quality <= 0) bytes; *len is set. Free with ap_free.
+#include <stddef.h>
+char *ap_frame(const char *dev_dir, const char *udid, double quality, size_t *len, char **err);
+
 void ap_free(char *s);
 
 #ifdef __cplusplus

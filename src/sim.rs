@@ -287,7 +287,7 @@ pub fn crashes(app: Option<&str>, limit: usize) -> Result<Vec<Crash>> {
         .filter(|e| e.path().extension().is_some_and(|x| x == "ips"))
         .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
         .collect();
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|f| std::cmp::Reverse(f.0));
     let mut out = Vec::new();
     for (_, path) in files {
         let Ok(text) = std::fs::read_to_string(&path) else { continue };
@@ -326,77 +326,129 @@ pub fn crashes(app: Option<&str>, limit: usize) -> Result<Vec<Crash>> {
     Ok(out)
 }
 
+/// A tool left running in the background (screen recording, profiling), stopped later with
+/// Ctrl-C (SIGINT) so it finishes writing its file.
 #[derive(Serialize, Deserialize)]
-struct Recording {
+struct Job {
     pid: u32,
     path: String,
 }
 
-fn recording_file(udid: &str) -> Result<PathBuf> {
-    let dir = crate::snapshot::home()?.join("recordings");
+fn job_file(kind: &str, udid: &str) -> Result<PathBuf> {
+    let dir = crate::snapshot::home()?.join("jobs");
     std::fs::create_dir_all(&dir)?;
-    Ok(dir.join(format!("{udid}.json")))
+    Ok(dir.join(format!("{kind}-{udid}.json")))
 }
 
 fn alive(pid: u32) -> bool {
     Command::new("kill").args(["-0", &pid.to_string()]).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
 }
 
-pub fn record_start(udid: &str, path: &str) -> Result<()> {
-    let file = recording_file(udid)?;
-    if let Ok(bytes) = std::fs::read(&file) {
-        if let Ok(r) = serde_json::from_slice::<Recording>(&bytes) {
-            if alive(r.pid) {
-                bail!("already recording to {}; run `agent-phone record stop` first", r.path);
-            }
+/// Starts `program args` detached and waits until its output contains `ready`.
+fn job_start(kind: &str, udid: &str, program: &str, args: &[&str], path: &str, ready: &str) -> Result<()> {
+    let file = job_file(kind, udid)?;
+    if let Ok(job) = serde_json::from_slice::<Job>(&std::fs::read(&file).unwrap_or_default()) {
+        if alive(job.pid) {
+            bail!("already running ({}); run `agent-phone {kind} stop` first", job.path);
         }
     }
     use std::os::unix::process::CommandExt;
-    // The recorder outlives this process, so its output goes to a file rather than a pipe.
+    // The tool outlives this process, so its output goes to a file rather than a pipe.
     let log = file.with_extension("log");
-    let mut child = Command::new("xcrun")
-        .args(["simctl", "io", udid, "recordVideo", "--codec", "h264", "--force", path])
+    let mut child = Command::new(program)
+        .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(std::fs::File::create(&log)?)
+        .stdout(std::fs::File::create(&log)?)
+        .stderr(std::fs::File::create(log.with_extension("err"))?)
         .process_group(0)
         .spawn()
-        .context("could not start recording")?;
-    // simctl prints "Recording started" once frames are flowing.
+        .with_context(|| format!("could not start {program}"))?;
+    let output = || format!("{}{}", std::fs::read_to_string(&log).unwrap_or_default(), std::fs::read_to_string(log.with_extension("err")).unwrap_or_default());
     let started = Instant::now();
     loop {
-        if std::fs::read_to_string(&log).is_ok_and(|t| t.contains("Recording started")) {
+        if output().contains(ready) {
             break;
         }
         if let Some(status) = child.try_wait()? {
-            let text = std::fs::read_to_string(&log).unwrap_or_default();
-            bail!("the recorder exited ({status}): {}", text.lines().last().unwrap_or_default());
+            let text = output();
+            bail!("{kind} exited ({status}): {}", text.lines().rfind(|l| !l.trim().is_empty()).unwrap_or_default());
         }
-        if started.elapsed() > Duration::from_secs(8) {
+        if started.elapsed() > Duration::from_secs(20) {
             let _ = child.kill();
-            bail!("the recorder did not start");
+            bail!("{kind} did not start");
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    std::fs::write(file, serde_json::to_vec(&Recording { pid: child.id(), path: path.into() })?)?;
+    std::fs::write(file, serde_json::to_vec(&Job { pid: child.id(), path: path.into() })?)?;
     Ok(())
 }
 
-pub fn record_stop(udid: &str) -> Result<String> {
-    let file = recording_file(udid)?;
-    let Ok(bytes) = std::fs::read(&file) else { bail!("nothing is recording; start with `agent-phone record start`") };
-    let r: Recording = serde_json::from_slice(&bytes)?;
+/// Interrupts a background tool and waits for it to finish writing. Returns its output path.
+fn job_stop(kind: &str, udid: &str, wait: Duration) -> Result<String> {
+    let file = job_file(kind, udid)?;
+    let Ok(bytes) = std::fs::read(&file) else { bail!("nothing is running; start with `agent-phone {kind} start`") };
+    let job: Job = serde_json::from_slice(&bytes)?;
     let _ = std::fs::remove_file(&file);
-    if !alive(r.pid) {
-        bail!("the recording to {} had already stopped", r.path);
+    if !alive(job.pid) {
+        bail!("{kind} to {} had already stopped", job.path);
     }
-    Command::new("kill").args(["-INT", &r.pid.to_string()]).status()?;
+    Command::new("kill").args(["-INT", &job.pid.to_string()]).status()?;
     let started = Instant::now();
-    while alive(r.pid) {
-        if started.elapsed() > Duration::from_secs(15) {
-            bail!("the recorder did not finish writing {}", r.path);
+    while alive(job.pid) {
+        if started.elapsed() > wait {
+            bail!("{kind} did not finish writing {}", job.path);
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    Ok(r.path)
+    Ok(job.path)
+}
+
+pub fn record_start(udid: &str, path: &str) -> Result<()> {
+    // simctl prints "Recording started" once frames are flowing.
+    job_start("record", udid, "xcrun", &["simctl", "io", udid, "recordVideo", "--codec", "h264", "--force", path], path, "Recording started")
+}
+
+pub fn record_stop(udid: &str) -> Result<String> {
+    job_stop("record", udid, Duration::from_secs(15))
+}
+
+/// Instruments templates by short name.
+pub fn template(name: &str) -> &str {
+    match name.to_lowercase().as_str() {
+        "time" | "cpu" | "time-profiler" => "Time Profiler",
+        "allocations" | "memory" => "Allocations",
+        "leaks" => "Leaks",
+        "hitches" | "animation" => "Animation Hitches",
+        "swiftui" => "SwiftUI",
+        "network" => "Network",
+        "energy" | "power" => "Power Profiler",
+        _ => name,
+    }
+}
+
+pub fn profile_start(udid: &str, process: &str, template_name: &str, path: &str) -> Result<()> {
+    let _ = std::fs::remove_dir_all(path);
+    job_start(
+        "profile",
+        udid,
+        "xcrun",
+        &["xctrace", "record", "--template", template_name, "--device", udid, "--attach", process, "--output", path],
+        path,
+        "Ctrl-C to stop",
+    )
+}
+
+pub fn profile_stop(udid: &str) -> Result<String> {
+    job_stop("profile", udid, Duration::from_secs(120))
+}
+
+/// CPU time (seconds) and resident memory (bytes) of a process. Simulator apps are Mac processes.
+pub fn usage(pid: i64) -> Result<(f64, u64)> {
+    let out = Command::new("ps").args(["-p", &pid.to_string(), "-o", "time=,rss="]).output()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut cols = text.split_whitespace();
+    let (Some(time), Some(rss)) = (cols.next(), cols.next()) else { bail!("process {pid} is gone") };
+    // [[hh:]mm:]ss.ss
+    let secs = time.split(':').fold(0.0, |acc, part| acc * 60.0 + part.parse::<f64>().unwrap_or(0.0));
+    Ok((secs, rss.parse::<u64>().unwrap_or(0) * 1024))
 }

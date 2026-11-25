@@ -524,3 +524,92 @@ char *ap_snapshot(const char *dev_dir, const char *udid, double timeout_s, char 
     return result;
   }
 }
+
+#pragma mark - Framebuffer
+
+#import <IOSurface/IOSurface.h>
+#import <ImageIO/ImageIO.h>
+
+// The main display's framebuffer, from the device's IO ports (as Simulator.app shows it).
+static IOSurfaceRef main_surface(id<APSimDevice> device, char **err) {
+  id io = [(id)device respondsToSelector:@selector(io)] ? [(id)device performSelector:@selector(io)] : nil;
+  NSArray *ports = [io respondsToSelector:@selector(ioPorts)] ? [io performSelector:@selector(ioPorts)] : nil;
+  IOSurfaceRef best = NULL;
+  size_t bestArea = 0;
+  for (id port in ports ?: @[]) {
+    id descriptor = [port respondsToSelector:@selector(descriptor)] ? [port performSelector:@selector(descriptor)] : nil;
+    for (NSString *name in @[ @"framebufferSurface", @"ioSurface" ]) {
+      SEL sel = NSSelectorFromString(name);
+      if (![descriptor respondsToSelector:sel]) {
+        continue;
+      }
+      IOSurfaceRef (*getter)(id, SEL) = (IOSurfaceRef(*)(id, SEL))[descriptor methodForSelector:sel];
+      IOSurfaceRef surface = getter(descriptor, sel);
+      if (!surface) {
+        continue;
+      }
+      size_t area = IOSurfaceGetWidth(surface) * IOSurfaceGetHeight(surface);
+      if (area > bestArea) {
+        best = surface;
+        bestArea = area;
+      }
+    }
+  }
+  if (!best) {
+    set_err(err, @"the simulator exposes no display surface");
+  }
+  return best;
+}
+
+// The screen as an image file: JPEG at `quality` (0-1), or PNG when quality <= 0.
+// Returns a malloc'd buffer and sets *len; free it with ap_free.
+char *ap_frame(const char *dev_dir, const char *udid, double quality, size_t *len, char **err) {
+  @autoreleasepool {
+    @try {
+      id<APSimDevice> device = find_device(dev_dir, udid, err);
+      if (!device) {
+        return NULL;
+      }
+      IOSurfaceRef surface = main_surface(device, err);
+      if (!surface) {
+        return NULL;
+      }
+      CFRetain(surface);
+      IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+      size_t w = IOSurfaceGetWidth(surface), h = IOSurfaceGetHeight(surface), row = IOSurfaceGetBytesPerRow(surface);
+      CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+      CGContextRef ctx = CGBitmapContextCreate(IOSurfaceGetBaseAddress(surface), w, h, 8, row, space,
+                                               kCGBitmapByteOrder32Little | (CGBitmapInfo)kCGImageAlphaPremultipliedFirst);
+      CGImageRef image = ctx ? CGBitmapContextCreateImage(ctx) : NULL;
+      if (ctx) {
+        CGContextRelease(ctx);
+      }
+      CGColorSpaceRelease(space);
+      IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+      CFRelease(surface);
+      if (!image) {
+        set_err(err, @"could not read the display surface");
+        return NULL;
+      }
+      NSMutableData *data = [NSMutableData data];
+      CFStringRef type = quality > 0 ? CFSTR("public.jpeg") : CFSTR("public.png");
+      CGImageDestinationRef dest = CGImageDestinationCreateWithData((__bridge CFMutableDataRef)data, type, 1, NULL);
+      NSDictionary *props = quality > 0 ? @{(id)kCGImageDestinationLossyCompressionQuality : @(quality)} : @{};
+      CGImageDestinationAddImage(dest, image, (__bridge CFDictionaryRef)props);
+      BOOL ok = CGImageDestinationFinalize(dest);
+      CFRelease(dest);
+      CGImageRelease(image);
+      if (!ok) {
+        set_err(err, @"could not encode the frame");
+        return NULL;
+      }
+      char *out = malloc(data.length);
+      memcpy(out, data.bytes, data.length);
+      *len = data.length;
+      return out;
+    } @catch (NSException *exception) {
+      set_err(err, exception.reason);
+      return NULL;
+    }
+  }
+}
