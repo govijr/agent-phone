@@ -7,13 +7,14 @@ mod keys;
 mod mcp;
 mod mirror;
 mod native;
+mod sim;
 mod snapshot;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use snapshot::{By, Element, Query, RenderOptions, Session, Snapshot};
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -36,6 +37,10 @@ pub struct Cli {
     /// Run in this process instead of the background daemon.
     #[arg(long, global = true, env = "AGENT_PHONE_NO_DAEMON")]
     no_daemon: bool,
+
+    /// Answer system alerts (permission prompts) automatically before each command.
+    #[arg(long, global = true, env = "AGENT_PHONE_DIALOGS")]
+    dialogs: Option<DialogAnswer>,
 
     #[command(subcommand)]
     command: Command,
@@ -60,7 +65,11 @@ enum Command {
     /// Shut the simulator down.
     Shutdown,
     /// List installed apps and their bundle IDs (simulator).
-    Apps,
+    Apps {
+        /// Only apps that are running, with their process IDs.
+        #[arg(long)]
+        running: bool,
+    },
     /// Launch an app (bundle ID on a simulator, app name on an iPhone), or open a URL.
     Open {
         target: String,
@@ -86,6 +95,9 @@ enum Command {
         /// Only print what changed since the last snapshot (+ new, - gone).
         #[arg(long)]
         diff: bool,
+        /// Print the raw accessibility tree as JSON (for debugging agent-phone).
+        #[arg(long, hide = true)]
+        raw: bool,
     },
     /// Tap an element or point.
     #[command(visible_alias = "tap")]
@@ -135,6 +147,114 @@ enum Command {
         from: Option<String>,
         #[arg(long)]
         distance: Option<f64>,
+    },
+    /// Go back: the navigation bar's back button, or a swipe from the left edge.
+    Back,
+    /// Relaunch the frontmost app (simulator).
+    Reload,
+    /// Double-tap an element or point.
+    Dblclick { target: String },
+    /// Drag from one target to another. Add --hold 600 to pick an item up first (reordering).
+    Drag {
+        from: String,
+        to: String,
+        /// Hold at the start for this many milliseconds.
+        #[arg(long, default_value_t = 0)]
+        hold: u32,
+        /// How long the move takes, in milliseconds.
+        #[arg(long, default_value_t = 400)]
+        duration: u32,
+    },
+    /// Turn a switch or checkbox on (does nothing if it already is).
+    Check { target: String },
+    /// Turn a switch or checkbox off (does nothing if it already is).
+    Uncheck { target: String },
+    /// System alerts such as permission prompts: show it, accept it, or dismiss it.
+    Dialog {
+        #[arg(default_value = "status")]
+        action: DialogAction,
+    },
+    /// Change simulator settings: location, appearance, permission, statusbar, text-size, contrast.
+    Set {
+        #[command(subcommand)]
+        what: SetCommand,
+    },
+    /// Send a push notification to an app (simulator).
+    ///
+    /// agent-phone push com.example.app --title "Hi" --body "New message" · push com.example.app payload.json
+    Push {
+        bundle_id: String,
+        /// A JSON file, or JSON text, with an "aps" object.
+        payload: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        badge: Option<u32>,
+    },
+    /// Save, restore or reset an app's data (documents, databases, preferences) (simulator).
+    State {
+        #[command(subcommand)]
+        action: StateCommand,
+    },
+    /// Reset the simulator's keychain (saved passwords and tokens for every app).
+    Keychain { action: KeychainAction },
+    /// Add photos, videos or contacts (vCard) to the simulator.
+    Media { action: MediaAction, paths: Vec<String> },
+    /// Read or set the simulator's clipboard.
+    Clipboard { action: ClipboardAction, text: Option<String> },
+    /// Recent log lines from an app (the frontmost one by default).
+    Logs {
+        /// Bundle ID; defaults to the frontmost app.
+        #[arg(long)]
+        app: Option<String>,
+        /// Every process, not just one app.
+        #[arg(long)]
+        all: bool,
+        /// How far back: 30s, 5m, 1h.
+        #[arg(long, default_value = "1m")]
+        last: String,
+        /// Only errors and faults.
+        #[arg(long)]
+        errors: bool,
+        /// Only lines containing this text.
+        #[arg(long)]
+        grep: Option<String>,
+        /// Keep printing new lines until interrupted.
+        #[arg(long)]
+        follow: bool,
+        /// Print at most this many lines (the newest).
+        #[arg(long, default_value_t = 200)]
+        lines: usize,
+    },
+    /// Recent crash reports from simulator apps.
+    Crashes {
+        /// App name or bundle ID.
+        #[arg(long)]
+        app: Option<String>,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+    /// Check the screen for accessibility problems: missing labels, small tap targets, duplicates.
+    Audit,
+    /// Record the screen to a video: `record start [path]`, then `record stop`.
+    Record {
+        action: RecordAction,
+        #[arg(default_value = "recording.mp4")]
+        path: String,
+    },
+    /// Compare a screenshot with the screen now (or with another screenshot).
+    Diff {
+        baseline: String,
+        /// The image to compare with; defaults to a new screenshot.
+        current: Option<String>,
+        /// Write a picture with the changed pixels in red.
+        #[arg(long)]
+        out: Option<String>,
+        /// How much a colour channel must change (0-255) for a pixel to count.
+        #[arg(long, default_value_t = 24)]
+        threshold: u8,
     },
     /// Find elements by role, text, label, id, placeholder or value, and optionally act on one.
     ///
@@ -263,6 +383,113 @@ enum IsWhat {
     On,
 }
 
+#[derive(Clone, Copy, ValueEnum, PartialEq)]
+enum DialogAnswer {
+    Accept,
+    Dismiss,
+}
+
+#[derive(Clone, Copy, ValueEnum, PartialEq)]
+enum DialogAction {
+    Status,
+    Accept,
+    Dismiss,
+}
+
+#[derive(Subcommand)]
+enum SetCommand {
+    /// Simulated GPS position: `set location 37.3349,-122.0090`, or `set location clear`.
+    Location { value: String },
+    /// Light or dark mode.
+    Appearance { mode: Appearance },
+    /// `set permission location grant --app com.example.app`. Services: all, calendar, contacts,
+    /// contacts-limited, location, location-always, photos, photos-add, media-library,
+    /// microphone, motion, reminders, siri.
+    Permission {
+        service: String,
+        action: PermissionAction,
+        /// Bundle ID (needed for grant and revoke).
+        #[arg(long)]
+        app: Option<String>,
+    },
+    /// `clean` (9:41, full signal and battery) or `clear`.
+    Statusbar { mode: StatusBar },
+    /// Dynamic Type size: extra-small … extra-extra-extra-large, accessibility-medium …
+    /// accessibility-extra-extra-extra-large, increment or decrement.
+    TextSize { size: String },
+    /// Increase Contrast on or off.
+    Contrast { mode: OnOff },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Appearance {
+    Light,
+    Dark,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum PermissionAction {
+    Grant,
+    Revoke,
+    Reset,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum StatusBar {
+    Clean,
+    Clear,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum OnOff {
+    On,
+    Off,
+}
+
+#[derive(Subcommand)]
+enum StateCommand {
+    /// Copy an app's data under a name (the app is stopped first).
+    Save {
+        name: String,
+        /// Bundle ID; defaults to the frontmost app.
+        #[arg(long)]
+        app: Option<String>,
+    },
+    /// Put saved data back (the app is stopped; open it again).
+    Load { name: String },
+    /// Saved states.
+    List,
+    /// Forget a saved state.
+    Delete { name: String },
+    /// Empty an app's data, as if freshly installed (the keychain is separate).
+    Reset {
+        #[arg(long)]
+        app: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum KeychainAction {
+    Reset,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum MediaAction {
+    Add,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ClipboardAction {
+    Get,
+    Set,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum RecordAction {
+    Start,
+    Stop,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum DaemonAction {
     Status,
@@ -280,6 +507,7 @@ pub struct Output {
 struct Ctx {
     json: bool,
     device_arg: Option<String>,
+    dialogs: Option<DialogAnswer>,
     out: RefCell<String>,
     code: Cell<i32>,
 }
@@ -291,7 +519,19 @@ enum Backend {
 
 struct Phone {
     backend: Backend,
+    /// SpringBoard's process, which owns the home screen and system alerts.
+    springboard: OnceCell<Option<i64>>,
 }
+
+/// Buttons that say yes, and no, on iOS system alerts, best first.
+const ACCEPT: &[&str] = &[
+    "Allow While Using App", "Allow", "Allow Full Access", "Allow Access to All Photos", "OK", "Continue", "Open", "Yes",
+    "Allow Paste", "Done", "Allow Once",
+];
+const DISMISS: &[&str] = &[
+    "Don’t Allow", "Don't Allow", "Ask App Not to Track", "Cancel", "Not Now", "No", "Close", "Later", "Don’t Allow Paste",
+    "Keep Current Selection",
+];
 
 /// How a command names an element.
 enum Locator {
@@ -342,8 +582,22 @@ impl Ctx {
     fn phone(&self) -> Result<Rc<Phone>> {
         if self.mirror() {
             let m = mirror::Mirror::open()?;
-            return Ok(Rc::new(Phone { backend: Backend::Mirror(RefCell::new(m)) }));
+            return Ok(Rc::new(Phone { backend: Backend::Mirror(RefCell::new(m)), springboard: OnceCell::new() }));
         }
+        let phone = self.sim_phone()?;
+        if let Some(answer) = self.dialogs {
+            if let Some(note) = phone.answer_dialog(answer == DialogAnswer::Accept, false)? {
+                if self.json {
+                    eprintln!("{note}");
+                } else {
+                    self.out.borrow_mut().push_str(&format!("({note})\n"));
+                }
+            }
+        }
+        Ok(phone)
+    }
+
+    fn sim_phone(&self) -> Result<Rc<Phone>> {
         let key = self.device_arg.clone().unwrap_or_default();
         if let Some(phone) = PHONES.with(|p| p.borrow().get(&key).cloned()) {
             return Ok(phone);
@@ -353,7 +607,7 @@ impl Ctx {
             bail!("{} is not booted. Run `agent-phone boot \"{}\"`", device.name, device.name);
         }
         let native = native::Target::new(&device::developer_dir()?, &device.udid)?;
-        let phone = Rc::new(Phone { backend: Backend::Sim { udid: device.udid, native } });
+        let phone = Rc::new(Phone { backend: Backend::Sim { udid: device.udid, native }, springboard: OnceCell::new() });
         PHONES.with(|p| p.borrow_mut().insert(key, phone.clone()));
         Ok(phone)
     }
@@ -477,7 +731,15 @@ impl Phone {
         }
         let saved = self.saved_for(locator)?;
         let (width, height) = self.screen()?;
-        let mut element = self.find_in(&self.snapshot()?, locator, options.editable, saved.as_ref())?.context("no element")?;
+        let first = self.snapshot()?;
+        let found = self.find_in(&first, locator, options.editable, saved.as_ref()).map_err(|e| match self.system_alert(&first) {
+            Some(_) => e.context(format!(
+                "a system alert is in front (\"{}\"). Answer it with `agent-phone dialog accept` or `dialog dismiss`",
+                Self::alert_text(&first)
+            )),
+            None => e,
+        })?;
+        let mut element = found.context("no element")?;
         for attempt in 0.. {
             let (x, y) = element.center();
             let off = x < 0.0 || y < 0.0 || x > width || y > height;
@@ -504,7 +766,7 @@ impl Phone {
         if !element.enabled && !options.force {
             bail!("{} is disabled; pass --force to tap it anyway", element.describe());
         }
-        let point = element.center();
+        let point = element.tap_point();
         Ok((Some(element), point))
     }
 
@@ -674,6 +936,162 @@ impl Phone {
             Locator::Query(query, None) => snapshot.query(query).into_iter().any(on_screen),
             _ => matches!(self.find_in(snapshot, locator, false, saved), Ok(Some(e)) if on_screen(&e)),
         }
+    }
+}
+
+impl Phone {
+    fn springboard(&self) -> Option<i64> {
+        *self.springboard.get_or_init(|| match &self.backend {
+            Backend::Sim { udid, .. } => sim::springboard_pid(udid).ok().flatten(),
+            Backend::Mirror(_) => None,
+        })
+    }
+
+    /// A system alert (from SpringBoard) is in front: a few buttons and some text, nothing else.
+    fn system_alert<'a>(&self, snapshot: &'a Snapshot) -> Option<Vec<&'a Element>> {
+        if snapshot.pid.is_none() || snapshot.pid != self.springboard() {
+            return None;
+        }
+        let buttons: Vec<&Element> = snapshot.elements.iter().filter(|e| e.interactive).collect();
+        let alert = !buttons.is_empty()
+            && buttons.len() <= 6
+            && buttons.iter().all(|e| e.role == "button")
+            && snapshot.elements.iter().any(|e| e.role == "text");
+        alert.then_some(buttons)
+    }
+
+    fn alert_text(snapshot: &Snapshot) -> String {
+        snapshot.elements.iter().filter(|e| e.role == "text").filter_map(|e| e.name()).collect::<Vec<_>>().join(" ")
+    }
+
+    /// Taps the yes (or no) button of a system alert, if one is up. Returns what it did.
+    fn answer_dialog(&self, accept: bool, required: bool) -> Result<Option<String>> {
+        if self.is_mirror() {
+            return Ok(None);
+        }
+        let snapshot = self.snapshot()?;
+        let Some(buttons) = self.system_alert(&snapshot) else {
+            if required {
+                bail!("no system alert is on screen");
+            }
+            return Ok(None);
+        };
+        let wanted = if accept { ACCEPT } else { DISMISS };
+        let button = wanted
+            .iter()
+            .find_map(|w| buttons.iter().find(|b| b.label.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(w))))
+            .with_context(|| {
+                let names: Vec<String> = buttons.iter().map(|b| format!("\"{}\"", b.name().unwrap_or("?"))).collect();
+                format!("can't tell which button {} this alert; click one: {}", if accept { "accepts" } else { "dismisses" }, names.join(", "))
+            })?;
+        self.touch(&[button.center()], 30, 0)?;
+        std::thread::sleep(Duration::from_millis(500));
+        Ok(Some(format!("{} \"{}\" on the alert \"{}\"", if accept { "accepted with" } else { "dismissed with" }, button.name().unwrap_or("?"), Self::alert_text(&snapshot))))
+    }
+
+    /// The frontmost app's bundle ID.
+    fn frontmost(&self, snapshot: &Snapshot) -> Result<Option<String>> {
+        let Backend::Sim { udid, .. } = &self.backend else { return Ok(None) };
+        let Some(pid) = snapshot.pid else { return Ok(None) };
+        if Some(pid) == self.springboard() {
+            return Ok(Some("com.apple.springboard".into()));
+        }
+        Ok(sim::running(udid)?.into_iter().find(|r| r.pid == pid).map(|r| r.bundle_id))
+    }
+
+    fn frontmost_app(&self, what: &str) -> Result<String> {
+        let bundle = self.frontmost(&self.snapshot()?)?.context("can't tell which app is in front")?;
+        if bundle == "com.apple.springboard" {
+            bail!("no app is open (the home screen is in front); pass --app for `{what}`");
+        }
+        Ok(bundle)
+    }
+
+    fn back(&self) -> Result<String> {
+        let snapshot = self.snapshot()?;
+        let (w, h) = self.screen()?;
+        let named = snapshot.elements.iter().find(|e| {
+            e.role == "button"
+                && (e.label.as_deref().is_some_and(|l| l.eq_ignore_ascii_case("back")) || e.identifier.as_deref() == Some("BackButton"))
+        });
+        let corner = || {
+            snapshot.elements.iter().find(|e| {
+                let (x, y) = e.center();
+                e.role == "button" && e.enabled && y > 0.0 && y < 130.0 && x < w * 0.25
+            })
+        };
+        if let Some(button) = named.or_else(corner) {
+            self.touch(&[button.center()], 30, 0)?;
+            return Ok(format!("went back with {} (@{})", button.describe(), button.reference));
+        }
+        let y = h * 0.45;
+        let points: Vec<(f64, f64)> = (0..=16).map(|i| (1.0 + (w * 0.8) * i as f64 / 16.0, y)).collect();
+        self.touch(&points, 0, 12)?;
+        Ok("went back with a swipe from the left edge".into())
+    }
+
+    /// Turns a switch or checkbox on or off, then checks it took.
+    fn set_switch(&self, target: &str, on: bool) -> Result<String> {
+        let locator = Locator::parse(target);
+        let (element, point) = self.locate(&locator, LocateOptions::default())?;
+        let element = element.context("give a switch, not a point")?;
+        if !matches!(element.role.as_str(), "switch" | "checkbox" | "radio") && element.value.is_none() {
+            bail!("{} is not a switch or checkbox", element.describe());
+        }
+        let state = if on { "on" } else { "off" };
+        if element.on() == on {
+            return Ok(format!("{} is already {state}", element.describe()));
+        }
+        self.touch(&[point], 30, 0)?;
+        std::thread::sleep(Duration::from_millis(450));
+        let after = self.snapshot()?;
+        if let Some(now) = after.relocate(&element) {
+            if now.on() != on {
+                bail!("tapped {} but it is still {}", element.describe(), if on { "off" } else { "on" });
+            }
+        }
+        Ok(format!("turned {} {state}", element.describe()))
+    }
+}
+
+/// Accessibility problems on the screen: unlabelled controls, small tap targets, duplicates.
+fn audit(snapshot: &Snapshot) -> Vec<serde_json::Value> {
+    let mut issues = Vec::new();
+    let interactive: Vec<&Element> = snapshot.elements.iter().filter(|e| e.interactive).collect();
+    for e in &interactive {
+        if e.label.is_none() && e.placeholder.is_none() {
+            issues.push(json!({ "ref": e.reference, "issue": "no-label", "detail": format!("{} has no accessibility label; VoiceOver reads nothing useful", e.describe()) }));
+        }
+        // Small both ways, or a sliver: frames that are long in one direction are usually rows
+        // whose real hit area is larger.
+        let (w, h) = (e.frame[2], e.frame[3]);
+        let small = !e.editable() && e.role != "cell" && w > 0.0 && ((w < 44.0 && h < 44.0) || w.min(h) < 20.0);
+        if small {
+            issues.push(json!({ "ref": e.reference, "issue": "small-target", "detail": format!("{} is {:.0}x{:.0} pt; tap targets should be at least 44x44", e.describe(), e.frame[2], e.frame[3]) }));
+        }
+    }
+    let mut seen: HashMap<(String, String), Vec<&Element>> = HashMap::new();
+    for e in &interactive {
+        if let Some(label) = &e.label {
+            seen.entry((e.role.clone(), label.clone())).or_default().push(e);
+        }
+    }
+    let mut duplicates: Vec<_> = seen.into_iter().filter(|(_, v)| v.len() > 1).collect();
+    duplicates.sort_by_key(|(_, v)| v[0].reference.trim_start_matches('e').parse::<usize>().unwrap_or(0));
+    for ((role, label), elements) in duplicates {
+        let refs: Vec<String> = elements.iter().map(|e| format!("@{}", e.reference)).collect();
+        issues.push(json!({ "ref": elements[0].reference, "issue": "duplicate-label", "detail": format!("{} {role} elements are labelled \"{label}\" ({}); VoiceOver users can't tell them apart", elements.len(), refs.join(", ")) }));
+    }
+    issues
+}
+
+/// Makes a path absolute against the current folder, for tools that run elsewhere.
+fn absolute(path: &str) -> String {
+    let p = std::path::Path::new(path);
+    if p.is_absolute() {
+        path.to_string()
+    } else {
+        std::env::current_dir().map(|d| d.join(p).to_string_lossy().into_owned()).unwrap_or_else(|_| path.to_string())
     }
 }
 
@@ -866,7 +1284,13 @@ fn run(ctx: &Ctx, cli: Cli) -> Result<()> {
             daemon::stop_all();
             ctx.done(format!("shut down {}", device.name), json!({ "udid": device.udid }));
         }
-        Command::Apps => {
+        Command::Apps { running: true } => {
+            let phone = ctx.sim("apps")?;
+            let apps = sim::running(phone.sim().0)?;
+            let text: String = apps.iter().map(|a| format!("{:<8} {}\n", a.pid, a.bundle_id)).collect();
+            ctx.done(text, json!({ "apps": apps }));
+        }
+        Command::Apps { .. } => {
             let phone = ctx.sim("apps")?;
             let apps = device::apps(phone.sim().0)?;
             let mut text = String::new();
@@ -891,7 +1315,11 @@ fn run(ctx: &Ctx, cli: Cli) -> Result<()> {
             device::install(phone.sim().0, &path)?;
             ctx.done(format!("installed {path}"), json!({ "path": path }));
         }
-        Command::Snapshot { interactive, depth, scope, diff } => {
+        Command::Snapshot { raw: true, .. } => {
+            let phone = ctx.sim("snapshot --raw")?;
+            ctx.done(phone.sim().1.snapshot(5.0)?, json!({}));
+        }
+        Command::Snapshot { interactive, depth, scope, diff, .. } => {
             let phone = ctx.phone()?;
             let snapshot = phone.snapshot()?;
             let before = Session::load(phone.udid())?.elements;
@@ -944,6 +1372,294 @@ fn run(ctx: &Ctx, cli: Cli) -> Result<()> {
             phone.scroll(direction, from.as_deref(), distance)?;
             ctx.done("scrolled", json!({}));
         }
+        Command::Back => {
+            let phone = ctx.phone()?;
+            let note = phone.back()?;
+            ctx.done(note, json!({}));
+        }
+        Command::Reload => {
+            let phone = ctx.sim("reload")?;
+            let bundle = phone.frontmost_app("reload")?;
+            device::launch(phone.sim().0, &bundle, true)?;
+            ctx.done(format!("relaunched {bundle}"), json!({ "bundle_id": bundle }));
+        }
+        Command::Dblclick { target } => {
+            let phone = ctx.phone()?;
+            let (element, point) = phone.locate(&Locator::parse(&target), LocateOptions::default())?;
+            phone.touch(&[point], 30, 0)?;
+            std::thread::sleep(Duration::from_millis(70));
+            phone.touch(&[point], 30, 0)?;
+            ctx.done(format!("double-clicked {}", target_label(&element, point, &target)), element_json(&element, point));
+        }
+        Command::Drag { from, to, hold, duration } => {
+            let phone = ctx.phone()?;
+            let any = LocateOptions { force: true, ..Default::default() };
+            let (_, a) = phone.locate(&Locator::parse(&from), any)?;
+            let (_, b) = phone.locate(&Locator::parse(&to), any)?;
+            let steps = (duration / 16).max(4);
+            let mut points = vec![a];
+            points.extend((1..=steps).map(|i| {
+                let t = i as f64 / steps as f64;
+                (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t)
+            }));
+            // Rest on the target briefly so drop targets register the finger.
+            points.extend([b, b, b]);
+            phone.touch(&points, hold, 16)?;
+            ctx.done(format!("dragged from {:.0},{:.0} to {:.0},{:.0}", a.0, a.1, b.0, b.1), json!({ "from": [a.0, a.1], "to": [b.0, b.1] }));
+        }
+        Command::Check { target } | Command::Uncheck { target } if ctx.mirror() => {
+            bail!("`check` {SIM_ONLY} (switch states can't be read from the mirrored screen); click {target} instead")
+        }
+        Command::Check { target } => {
+            let note = ctx.phone()?.set_switch(&target, true)?;
+            ctx.done(note, json!({ "on": true }));
+        }
+        Command::Uncheck { target } => {
+            let note = ctx.phone()?.set_switch(&target, false)?;
+            ctx.done(note, json!({ "on": false }));
+        }
+        Command::Dialog { action } => {
+            let phone = ctx.sim("dialog")?;
+            match action {
+                DialogAction::Status => {
+                    let snapshot = phone.snapshot()?;
+                    match phone.system_alert(&snapshot) {
+                        Some(buttons) => {
+                            let text = Phone::alert_text(&snapshot);
+                            Session::save(phone.udid(), &snapshot)?;
+                            let list = snapshot.render_with(&buttons, &RenderOptions { flat: true, ..Default::default() });
+                            ctx.done(format!("system alert: \"{text}\"\n{list}"), json!({ "alert": true, "text": text, "buttons": buttons }));
+                        }
+                        None => ctx.done("no system alert", json!({ "alert": false })),
+                    }
+                }
+                DialogAction::Accept | DialogAction::Dismiss => {
+                    let note = phone.answer_dialog(action == DialogAction::Accept, true)?.unwrap_or_default();
+                    ctx.done(note, json!({}));
+                }
+            }
+        }
+        Command::Set { what } => {
+            let phone = ctx.sim("set")?;
+            let udid = phone.sim().0;
+            let note = match what {
+                SetCommand::Location { value } if value == "clear" => {
+                    sim::clear_location(udid)?;
+                    "cleared the simulated location".to_string()
+                }
+                SetCommand::Location { value } => {
+                    let (lat, lon) = parse_point(&value).context("give latitude,longitude, e.g. `set location 37.3349,-122.0090`")?;
+                    sim::set_location(udid, lat, lon)?;
+                    format!("location set to {lat},{lon}")
+                }
+                SetCommand::Appearance { mode } => {
+                    let mode = match mode {
+                        Appearance::Light => "light",
+                        Appearance::Dark => "dark",
+                    };
+                    sim::ui(udid, "appearance", mode)?;
+                    format!("appearance set to {mode}")
+                }
+                SetCommand::Permission { service, action, app } => {
+                    let action = match action {
+                        PermissionAction::Grant => "grant",
+                        PermissionAction::Revoke => "revoke",
+                        PermissionAction::Reset => "reset",
+                    };
+                    let app = match app {
+                        Some(app) => Some(app),
+                        None if action == "reset" => None,
+                        None => Some(phone.frontmost_app("set permission")?),
+                    };
+                    sim::privacy(udid, action, &service, app.as_deref())?;
+                    format!("{action} {service}{}", app.map(|a| format!(" for {a}")).unwrap_or_default())
+                }
+                SetCommand::Statusbar { mode: StatusBar::Clean } => {
+                    sim::status_bar_clean(udid)?;
+                    "status bar set to 9:41 with full signal and battery".into()
+                }
+                SetCommand::Statusbar { mode: StatusBar::Clear } => {
+                    sim::status_bar_clear(udid)?;
+                    "status bar back to normal".into()
+                }
+                SetCommand::TextSize { size } => {
+                    sim::ui(udid, "content_size", &size)?;
+                    format!("text size set to {size}")
+                }
+                SetCommand::Contrast { mode } => {
+                    let on = matches!(mode, OnOff::On);
+                    sim::ui(udid, "increase_contrast", if on { "enabled" } else { "disabled" })?;
+                    format!("Increase Contrast {}", if on { "on" } else { "off" })
+                }
+            };
+            ctx.done(note, json!({}));
+        }
+        Command::Push { bundle_id, payload, title, body, badge } => {
+            let phone = ctx.sim("push")?;
+            let payload: serde_json::Value = match payload {
+                Some(p) if p.trim_start().starts_with('{') => serde_json::from_str(&p).context("the payload is not valid JSON")?,
+                Some(p) => serde_json::from_slice(&std::fs::read(&p).with_context(|| format!("could not read {p}"))?).context("the payload is not valid JSON")?,
+                None => {
+                    let mut aps = json!({ "alert": { "title": title.unwrap_or_default(), "body": body.unwrap_or_default() }, "sound": "default" });
+                    if let Some(badge) = badge {
+                        aps["badge"] = json!(badge);
+                    }
+                    json!({ "aps": aps })
+                }
+            };
+            if payload.get("aps").is_none() {
+                bail!("the payload needs an \"aps\" object");
+            }
+            sim::push(phone.sim().0, &bundle_id, &payload)?;
+            ctx.done(format!("pushed a notification to {bundle_id}"), json!({ "payload": payload }));
+        }
+        Command::State { action } => {
+            let phone = ctx.sim("state")?;
+            let udid = phone.sim().0;
+            match action {
+                StateCommand::Save { name, app } => {
+                    let bundle = match app {
+                        Some(a) => a,
+                        None => phone.frontmost_app("state save")?,
+                    };
+                    let dir = sim::save_state(udid, &bundle, &name)?;
+                    ctx.done(format!("saved {bundle}'s data as \"{name}\" (the app was stopped)"), json!({ "name": name, "bundle_id": bundle, "path": dir }));
+                }
+                StateCommand::Load { name } => {
+                    let bundle = sim::load_state(udid, &name)?;
+                    ctx.done(format!("restored \"{name}\" into {bundle}; `agent-phone open {bundle}` to use it"), json!({ "name": name, "bundle_id": bundle }));
+                }
+                StateCommand::List => {
+                    let states = sim::list_states()?;
+                    let text = if states.is_empty() {
+                        "no saved states".to_string()
+                    } else {
+                        states.iter().map(|(n, m)| format!("{n:<20} {}", m.bundle_id)).collect::<Vec<_>>().join("\n")
+                    };
+                    let data: Vec<_> = states.iter().map(|(n, m)| json!({ "name": n, "bundle_id": m.bundle_id, "saved_at": m.saved_at })).collect();
+                    ctx.done(text, json!({ "states": data }));
+                }
+                StateCommand::Delete { name } => {
+                    sim::delete_state(&name)?;
+                    ctx.done(format!("deleted \"{name}\""), json!({ "name": name }));
+                }
+                StateCommand::Reset { app } => {
+                    let bundle = match app {
+                        Some(a) => a,
+                        None => phone.frontmost_app("state reset")?,
+                    };
+                    sim::reset_state(udid, &bundle)?;
+                    ctx.done(format!("emptied {bundle}'s data (the app was stopped)"), json!({ "bundle_id": bundle }));
+                }
+            }
+        }
+        Command::Keychain { action: KeychainAction::Reset } => {
+            let phone = ctx.sim("keychain")?;
+            sim::keychain_reset(phone.sim().0)?;
+            ctx.done("reset the keychain", json!({}));
+        }
+        Command::Media { action: MediaAction::Add, paths } => {
+            let phone = ctx.sim("media")?;
+            if paths.is_empty() {
+                bail!("give one or more files: `agent-phone media add photo.jpg clip.mov`");
+            }
+            let paths: Vec<String> = paths.iter().map(|p| absolute(p)).collect();
+            sim::add_media(phone.sim().0, &paths)?;
+            ctx.done(format!("added {} file{}", paths.len(), if paths.len() == 1 { "" } else { "s" }), json!({ "paths": paths }));
+        }
+        Command::Clipboard { action, text } => {
+            let phone = ctx.sim("clipboard")?;
+            match action {
+                ClipboardAction::Get => {
+                    let text = device::pasteboard(phone.sim().0)?;
+                    ctx.done(text.clone(), json!({ "text": text }));
+                }
+                ClipboardAction::Set => {
+                    let text = text.context("give the text: `agent-phone clipboard set \"hello\"`")?;
+                    device::set_pasteboard(phone.sim().0, &text)?;
+                    ctx.done(format!("clipboard set ({} characters)", text.chars().count()), json!({}));
+                }
+            }
+        }
+        Command::Logs { app, all, last, errors, grep, follow, lines } => {
+            let phone = ctx.sim("logs")?;
+            let udid = phone.sim().0;
+            let bundle = match (all, app) {
+                (true, _) => None,
+                (false, Some(app)) => Some(app),
+                (false, None) => Some(phone.frontmost_app("logs")?),
+            };
+            let process = bundle.as_deref().map(|b| sim::executable(udid, b)).transpose()?;
+            let query = sim::LogQuery { process, last, errors, grep };
+            if follow {
+                query.follow(udid)?;
+                return Ok(());
+            }
+            let text = query.show(udid)?;
+            // Drop log's own header line, keep the newest `lines`.
+            let body: Vec<&str> = text.lines().filter(|l| !l.starts_with("Timestamp ") && !l.trim().is_empty()).collect();
+            let shown = &body[body.len().saturating_sub(lines)..];
+            let out = if shown.is_empty() { "(no log lines)".to_string() } else { shown.join("\n") };
+            ctx.done(out, json!({ "lines": shown }));
+        }
+        Command::Crashes { app, limit } => {
+            let list = sim::crashes(app.as_deref(), limit)?;
+            let text = if list.is_empty() {
+                "no crash reports".to_string()
+            } else {
+                list.iter().map(|c| format!("{}  {}  {}\n  {}", c.time, c.app, c.exception, c.path)).collect::<Vec<_>>().join("\n")
+            };
+            ctx.done(text, json!({ "crashes": list }));
+        }
+        Command::Audit => {
+            let phone = ctx.phone()?;
+            if phone.is_mirror() {
+                bail!("`audit` {SIM_ONLY}");
+            }
+            let snapshot = phone.snapshot()?;
+            Session::save(phone.udid(), &snapshot)?;
+            let issues = audit(&snapshot);
+            let text = if issues.is_empty() {
+                "no problems found on this screen".to_string()
+            } else {
+                issues.iter().map(|i| format!("@{} {}: {}", i["ref"].as_str().unwrap_or(""), i["issue"].as_str().unwrap_or(""), i["detail"].as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n")
+            };
+            ctx.done(text, json!({ "issues": issues }));
+        }
+        Command::Record { action, path } => {
+            let phone = ctx.sim("record")?;
+            let udid = phone.sim().0;
+            match action {
+                RecordAction::Start => {
+                    let path = absolute(&path);
+                    sim::record_start(udid, &path)?;
+                    ctx.done(format!("recording to {path}; `agent-phone record stop` to finish"), json!({ "path": path }));
+                }
+                RecordAction::Stop => {
+                    let path = sim::record_stop(udid)?;
+                    ctx.done(format!("saved {path}"), json!({ "path": path }));
+                }
+            }
+        }
+        Command::Diff { baseline, current, out, threshold } => {
+            let current = match current {
+                Some(c) => c,
+                None => {
+                    let phone = ctx.phone()?;
+                    let path = std::env::temp_dir().join(format!("agent-phone-diff-{}.png", std::process::id())).to_string_lossy().into_owned();
+                    phone.screenshot(&path)?;
+                    path
+                }
+            };
+            let ratio = annotate::diff(&baseline, &current, out.as_deref(), threshold)?;
+            let percent = ratio * 100.0;
+            let summary = if ratio == 0.0 { "identical".to_string() } else { format!("{percent:.2}% of pixels changed") };
+            let text = match &out {
+                Some(o) => format!("{summary}; changes marked in {o}"),
+                None => summary,
+            };
+            ctx.done(text, json!({ "changed": ratio, "identical": ratio == 0.0, "out": out }));
+        }
         Command::Find { by, value, action, text, name, exact, nth, force } => {
             let phone = ctx.phone()?;
             let query = Query { by, value, name, exact };
@@ -988,7 +1704,13 @@ fn run(ctx: &Ctx, cli: Cli) -> Result<()> {
             match what {
                 GetWhat::App => {
                     snapshot = phone.snapshot()?;
-                    value = json!(snapshot.app);
+                    let bundle = phone.frontmost(&snapshot).ok().flatten();
+                    value = match (&snapshot.app, &bundle) {
+                        _ if phone.system_alert(&snapshot).is_some() => json!("System alert (com.apple.springboard)"),
+                        (_, Some(b)) if b == "com.apple.springboard" => json!("Home Screen (com.apple.springboard)"),
+                        (Some(name), Some(b)) => json!(format!("{name} ({b})")),
+                        (name, b) => json!(name.clone().or(b.clone())),
+                    };
                     extra = None;
                 }
                 GetWhat::Size => {
@@ -1207,7 +1929,7 @@ fn run(ctx: &Ctx, cli: Cli) -> Result<()> {
 
 /// Runs a parsed command in this process and returns what it printed.
 pub fn execute(cli: Cli) -> Output {
-    let ctx = Ctx { json: cli.json, device_arg: cli.device.clone(), out: RefCell::new(String::new()), code: Cell::new(0) };
+    let ctx = Ctx { json: cli.json, device_arg: cli.device.clone(), dialogs: cli.dialogs, out: RefCell::new(String::new()), code: Cell::new(0) };
     match run(&ctx, cli) {
         Ok(()) => Output { stdout: ctx.out.take(), stderr: String::new(), code: ctx.code.get() },
         Err(error) => {
@@ -1245,7 +1967,7 @@ pub fn execute_args(args: Vec<String>) -> Output {
 fn dispatch(args: Vec<String>) -> Output {
     if let Ok(cli) = Cli::try_parse_from(&args) {
         if cli.wants_daemon() {
-            if let Ok(out) = daemon::forward(&args, cli.device.as_deref()) {
+            if let Ok(out) = daemon::forward(&cli.with_env_flags(args.clone()), cli.device.as_deref()) {
                 return out;
             }
         }
@@ -1255,6 +1977,16 @@ fn dispatch(args: Vec<String>) -> Output {
 }
 
 impl Cli {
+    /// `args` with settings that came from the environment spelled out, since the daemon has its own.
+    fn with_env_flags(&self, mut args: Vec<String>) -> Vec<String> {
+        let given = args.iter().any(|a| a == "--dialogs" || a.starts_with("--dialogs="));
+        if let (Some(answer), false) = (self.dialogs, given) {
+            let value = if answer == DialogAnswer::Accept { "accept" } else { "dismiss" };
+            args.splice(1..1, ["--dialogs".to_string(), value.to_string()]);
+        }
+        args
+    }
+
     /// Commands that talk to a simulator go through its daemon.
     fn wants_daemon(&self) -> bool {
         if self.no_daemon || mirror::selected(self.device.as_deref()) {
@@ -1262,7 +1994,17 @@ impl Cli {
         }
         matches!(
             self.command,
-            Command::Apps
+            Command::Apps { .. }
+                | Command::Back
+                | Command::Reload
+                | Command::Dblclick { .. }
+                | Command::Drag { .. }
+                | Command::Check { .. }
+                | Command::Uncheck { .. }
+                | Command::Dialog { .. }
+                | Command::Audit
+                | Command::Clipboard { .. }
+                | Command::Diff { .. }
                 | Command::Open { .. }
                 | Command::Close { .. }
                 | Command::Snapshot { .. }
@@ -1293,7 +2035,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cli = Cli::parse();
     if cli.wants_daemon() {
-        if let Ok(out) = daemon::forward(&args, cli.device.as_deref()) {
+        if let Ok(out) = daemon::forward(&cli.with_env_flags(args), cli.device.as_deref()) {
             emit(out);
         }
     }

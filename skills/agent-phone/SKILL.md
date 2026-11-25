@@ -27,6 +27,12 @@ Drive the iOS Simulator with the `agent-phone` CLI.
 - `agent-phone wait @e4`, `wait "Done" --gone`, or `wait --stable` (screen stopped changing) instead of fixed sleeps.
 - `agent-phone screenshot --annotate shot.png` labels each interactive element with its ref, so you can act on what you see.
 - `agent-phone batch "click @e4" "wait --text Done" "snapshot -i"` runs several commands in one call.
+- `agent-phone back` goes back a screen. `agent-phone reload` relaunches the app in front.
+- `agent-phone check "Wi-Fi"` / `uncheck` set a switch and confirm it changed. `drag @e5 @e9 --hold 600` reorders; without `--hold` it moves sliders.
+- A permission prompt or other system alert blocks taps on the app. `agent-phone dialog` shows it; `dialog accept` / `dialog dismiss` answers it. Or skip the prompt with `set permission camera grant --app <bundle-id>`.
+- Test setup: `set location 37.33,-122.01`, `set appearance dark`, `set text-size extra-large`, `push <bundle-id> --title Hi --body Test`, `media add photo.jpg`, `clipboard set "text"`.
+- `state save logged-in --app <bundle-id>` after signing in, then `state load logged-in` to start from there next time. `state reset --app <bundle-id>` makes the app fresh.
+- Debugging: `logs --errors --last 2m`, `crashes`, `audit` (accessibility), `record start` / `record stop`, `diff baseline.png --out changes.png`.
 - `agent-phone scroll down` reveals more content. `agent-phone swipe left --from @e7` swipes on an element.
 - `agent-phone click @e3 --hold 700` long-presses.
 - `agent-phone press home|lock|enter|tab|backspace|escape|up|down|left|right`
@@ -48,5 +54,6 @@ Use this when the user asks for their own phone, not a simulator. It goes throug
 
 - `is no longer on screen`: the screen changed. Run `snapshot` again and pick the new ref.
 - `is off screen`: agent-phone scrolls simulators for you; on an iPhone run `scroll` toward it first.
+- `a system alert is in front`: run `agent-phone dialog accept` or `dialog dismiss`.
 - `is disabled`: the app won't accept the tap yet. Fill the required fields first; use `--force` only on purpose.
 - An empty snapshot usually means the app is still loading. Wait, then try again.

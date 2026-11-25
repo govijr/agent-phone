@@ -31,3 +31,24 @@ pub fn draw(path: &str, elements: &[&Element], screen_width: f64) -> Result<()> 
     unsafe { ap_free(err) };
     Err(anyhow!(message))
 }
+
+extern "C" {
+    fn ap_image_diff(a: *const c_char, b: *const c_char, out: *const c_char, threshold: c_int, ratio: *mut c_double, err: *mut *mut c_char) -> c_int;
+}
+
+/// The share of pixels (0 to 1) that differ between two PNGs of the same size. With `out`, also
+/// writes a picture of the second image with the changes in red.
+pub fn diff(a: &str, b: &str, out: Option<&str>, threshold: u8) -> Result<f64> {
+    let (a, b, out) = (CString::new(a)?, CString::new(b)?, CString::new(out.unwrap_or(""))?);
+    let mut ratio = 0.0;
+    let mut err: *mut c_char = std::ptr::null_mut();
+    if unsafe { ap_image_diff(a.as_ptr(), b.as_ptr(), out.as_ptr(), threshold as c_int, &mut ratio, &mut err) } == 0 {
+        return Ok(ratio);
+    }
+    if err.is_null() {
+        return Err(anyhow!("could not compare the images"));
+    }
+    let message = unsafe { CStr::from_ptr(err) }.to_string_lossy().into_owned();
+    unsafe { ap_free(err) };
+    Err(anyhow!(message))
+}

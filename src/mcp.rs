@@ -101,6 +101,44 @@ const TOOLS: &[Tool] = &[
             p("distance", "number", Flag, false, "Points to move"),
         ],
     },
+    Tool { name: "back", command: "back", about: "Go back: taps the navigation bar's back button, or swipes from the left edge.", params: &[] },
+    Tool {
+        name: "drag",
+        command: "drag",
+        about: "Drag from one target to another (sliders, maps). Add hold=600 to pick an item up first (reordering, home screen icons).",
+        params: &[
+            p("from", "string", Arg, true, TARGET),
+            p("to", "string", Arg, true, TARGET),
+            p("hold", "integer", Flag, false, "Hold at the start for this many milliseconds"),
+        ],
+    },
+    Tool { name: "check", command: "check", about: "Turn a switch or checkbox on; does nothing if it already is.", params: &[p("target", "string", Arg, true, TARGET)] },
+    Tool { name: "uncheck", command: "uncheck", about: "Turn a switch or checkbox off; does nothing if it already is.", params: &[p("target", "string", Arg, true, TARGET)] },
+    Tool {
+        name: "dialog",
+        command: "dialog",
+        about: "System alerts (permission prompts and the like): status shows the alert and its buttons; accept or dismiss answers it.",
+        params: &[choice("action", Arg, false, "What to do (default: status)", &["status", "accept", "dismiss"])],
+    },
+    Tool {
+        name: "set",
+        command: "set",
+        about: "Change simulator settings, e.g. [\"location\", \"37.33,-122.01\"], [\"appearance\", \"dark\"], [\"permission\", \"camera\", \"grant\", \"--app\", \"com.x\"], [\"statusbar\", \"clean\"], [\"text-size\", \"extra-large\"], [\"contrast\", \"on\"].",
+        params: &[p("args", "array", Arg, true, "The setting and its value")],
+    },
+    Tool {
+        name: "logs",
+        command: "logs",
+        about: "Recent log lines from an app (the frontmost one unless app is given).",
+        params: &[
+            p("app", "string", Flag, false, "Bundle ID"),
+            p("last", "string", Flag, false, "How far back: 30s, 5m (default 1m)"),
+            p("errors", "boolean", Switch, false, "Only errors and faults"),
+            p("grep", "string", Flag, false, "Only lines containing this"),
+            p("lines", "integer", Flag, false, "At most this many lines (default 200)"),
+        ],
+    },
+    Tool { name: "audit", command: "audit", about: "Accessibility problems on the screen: unlabelled controls, small tap targets, duplicate labels.", params: &[] },
     Tool {
         name: "find",
         command: "find",
@@ -352,9 +390,10 @@ mod tests {
     fn every_tool_names_a_real_command() {
         for tool in TOOLS {
             let mut args = vec!["agent-phone".to_string(), tool.command.to_string()];
-            args.extend(tool.params.iter().filter(|p| p.required).map(|p| match p.choices.first() {
-                Some(c) => c.to_string(),
-                None => "1".to_string(),
+            args.extend(tool.params.iter().filter(|p| p.required).flat_map(|p| match (p.choices.first(), tool.name) {
+                (Some(c), _) => vec![c.to_string()],
+                (None, "set") => vec!["appearance".to_string(), "dark".to_string()],
+                (None, _) => vec!["1".to_string()],
             }));
             assert!(crate::Cli::try_parse_from(&args).is_ok(), "{args:?}");
         }

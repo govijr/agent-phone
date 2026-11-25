@@ -244,10 +244,10 @@ impl Mirror {
     /// language. The text stays on the Mac clipboard afterwards.
     pub fn paste(&self, text: &str) -> Result<()> {
         use std::io::Write;
-        let mut child = Command::new("pbcopy").stdin(std::process::Stdio::piped()).spawn().context("could not run pbcopy")?;
+        let mut child = crate::device::utf8(&mut Command::new("pbcopy")).stdin(std::process::Stdio::piped()).spawn().context("could not run pbcopy")?;
         child.stdin.take().context("no stdin for pbcopy")?.write_all(text.as_bytes())?;
         child.wait()?;
-        let check = Command::new("pbpaste").output()?;
+        let check = crate::device::utf8(&mut Command::new("pbpaste")).output()?;
         if check.stdout != text.as_bytes() {
             bail!("the Mac clipboard did not take the text; nothing was pasted");
         }

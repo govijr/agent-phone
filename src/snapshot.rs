@@ -21,6 +21,8 @@ struct RawNode {
     frame: [f64; 4],
     #[serde(default)]
     children: Vec<RawNode>,
+    #[serde(default)]
+    pid: Option<i64>,
 }
 
 /// One element on screen, with the ref it was given.
@@ -64,6 +66,16 @@ impl Element {
         matches!(self.role.as_str(), "textbox" | "searchbox" | "password")
     }
 
+    /// Where to tap. A switch whose frame covers its whole row (as in Settings) is tapped on the
+    /// toggle at the right end, since the label part doesn't flip it.
+    pub fn tap_point(&self) -> (f64, f64) {
+        let (x, y) = self.center();
+        if self.role == "switch" && self.frame[2] > 90.0 {
+            return (self.frame[0] + self.frame[2] - 26.0, y);
+        }
+        (x, y)
+    }
+
     /// A switch or checkbox that is on.
     pub fn on(&self) -> bool {
         matches!(self.value.as_deref(), Some("1" | "true" | "on" | "On"))
@@ -91,6 +103,8 @@ pub struct Snapshot {
     pub elements: Vec<Element>,
     /// The frontmost app's name, when the tree says.
     pub app: Option<String>,
+    /// The frontmost process (SpringBoard for the home screen and system alerts).
+    pub pid: Option<i64>,
 }
 
 /// What `find` searches by.
@@ -213,6 +227,7 @@ impl Snapshot {
     pub fn parse(json: &str) -> Result<Self> {
         let root: RawNode = serde_json::from_str(json).context("could not parse the accessibility tree")?;
         let app = clean(root.label.clone());
+        let pid = root.pid;
         let mut elements = Vec::new();
         for child in root.children {
             flatten(child, 0, &mut elements);
@@ -220,7 +235,7 @@ impl Snapshot {
         for (i, element) in elements.iter_mut().enumerate() {
             element.reference = format!("e{}", i + 1);
         }
-        Ok(Self { elements, app })
+        Ok(Self { elements, app, pid })
     }
 
     /// A snapshot from recognized text (iPhone Mirroring), in reading order. Text can't say
@@ -259,7 +274,7 @@ impl Snapshot {
                 depth: 0,
             })
             .collect();
-        Self { elements, app: None }
+        Self { elements, app: None, pid: None }
     }
 
     pub fn render(&self, interactive_only: bool) -> String {

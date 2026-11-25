@@ -43,13 +43,19 @@ cargo install --path .
 | `connect` | iPhone: open iPhone Mirroring in the background and wait for the phone |
 | `boot [name]` | Boot headless and wait until ready (defaults to the newest iPhone) |
 | `shutdown` | Shut the simulator down |
-| `apps` | Installed apps and bundle IDs |
+| `apps [--running]` | Installed apps and bundle IDs, or the running ones with process IDs |
 | `open <bundle-id\|url> [--fresh]` | Launch an app, or open a URL or deep link |
 | `close <bundle-id>` | Terminate an app |
 | `install <path.app>` | Install a build |
 | `snapshot [-i] [--depth n] [-s target] [--diff]` | Accessibility tree with refs; `-i` lists only interactive elements, `-s` one element and its contents, `--diff` only what changed since the last snapshot |
 | `click <target> [--hold ms] [--force]` | Tap (alias `tap`); `--hold 600` is a long press |
 | `fill <target> <text>` | Tap a field, clear it, type |
+| `back` | The navigation bar's back button, or a swipe from the left edge |
+| `reload` | Relaunch the frontmost app |
+| `dblclick <target>` | Double-tap |
+| `drag <from> <to> [--hold ms]` | Drag (sliders, maps); `--hold 600` picks an item up first, for reordering |
+| `check <target>` / `uncheck <target>` | Turn a switch on or off, and confirm it changed (does nothing if it already is) |
+| `dialog [accept\|dismiss]` | Show, accept or dismiss a system alert such as a permission prompt |
 | `find <role\|text\|label\|id\|placeholder\|value> <value> [click\|fill\|text\|count] [--name N] [--exact] [--nth n]` | Semantic locators: `find role button --name Done click`, `find id email fill "me@x.com"` |
 | `get <what> [target]` | `text`, `value`, `label`, `id`, `role`, `frame`, `count`; also `focused`, `app`, `size` |
 | `is <visible\|enabled\|focused\|selected\|on> <target>` | Prints `true` or `false` |
@@ -59,6 +65,20 @@ cargo install --path .
 | `scroll <dir>` | Scroll content (the finger moves the opposite way) |
 | `wait <ms\|target>` / `wait --text T` / `wait --stable` | Sleep, wait for an element or text to appear (or go with `--gone`), or for the screen to stop changing |
 | `screenshot [path] [--annotate]` | PNG of the screen; `--annotate` draws each interactive element's ref on it |
+| `set location <lat,lon\|clear>` | Simulated GPS position |
+| `set appearance <light\|dark>`, `set text-size <size>`, `set contrast <on\|off>` | Dark mode, Dynamic Type, Increase Contrast |
+| `set permission <service> <grant\|revoke\|reset> [--app id]` | Camera, photos, location, contacts… without the prompt |
+| `set statusbar <clean\|clear>` | 9:41 with full bars for screenshots, or back to normal |
+| `push <bundle-id> [payload] [--title T --body B]` | Send a push notification |
+| `state save\|load\|list\|delete <name>` / `state reset` | Save an app's data (for example logged in) and put it back later, or empty it |
+| `keychain reset` | Clear the simulator's keychain |
+| `media add <files…>` | Add photos, videos or contacts |
+| `clipboard get` / `clipboard set <text>` | Read or set the clipboard |
+| `logs [--app id] [--last 5m] [--errors] [--grep T] [--follow]` | Log lines from the frontmost app, or another |
+| `crashes [--app name]` | Recent crash reports from simulator apps |
+| `audit` | Accessibility problems: missing labels, small tap targets, duplicate labels |
+| `record start [path]` / `record stop` | Record the screen to an MP4 |
+| `diff <baseline.png> [current.png] [--out diff.png]` | How much of the screen changed against a baseline, with the changes marked in red |
 | `batch [cmd…]` | Run commands in order, from arguments or one per line on stdin; stops at the first failure unless `--keep-going` |
 | `skills get` | Print the agent guide built into the binary |
 | `mcp` | Run as an MCP server over stdio |
@@ -68,7 +88,7 @@ cargo install --path .
 
 **Refs are checked before every action.** agent-phone reads the screen again and finds the element by role, label and id. If it moved, the tap goes to its new position. If it's gone, the command fails with `is no longer on screen` and never taps something else. An element below or above the screen is scrolled into view first, and a disabled one is refused unless you pass `--force`.
 
-**Global flags:** `--device <name|udid>` (or `AGENT_PHONE_DEVICE`) picks a simulator when several are booted. `--json` prints `{"ok": true, ...}` or `{"ok": false, "error": ...}`. `--no-daemon` (or `AGENT_PHONE_NO_DAEMON=1`) runs the command in-process.
+**Global flags:** `--device <name|udid>` (or `AGENT_PHONE_DEVICE`) picks a simulator when several are booted. `--json` prints `{"ok": true, ...}` or `{"ok": false, "error": ...}`. `--no-daemon` (or `AGENT_PHONE_NO_DAEMON=1`) runs the command in-process. `--dialogs accept|dismiss` (or `AGENT_PHONE_DIALOGS`) answers system alerts before each command, so permission prompts don't block an agent.
 
 **The daemon.** The first simulator command starts a background process for that device, which keeps the simulator connection open, so later commands take tens of milliseconds instead of a few hundred. It exits after 30 idle minutes (`AGENT_PHONE_DAEMON_IDLE` in seconds), and restarts itself when you rebuild agent-phone. `boot` and `shutdown` stop it. iPhone Mirroring commands don't use it.
 
@@ -84,7 +104,7 @@ cargo install --path .
 - **Input is real Mac mouse and keyboard events.** The Mirroring window has to be in front. agent-phone brings it forward, confirms it's there, and refuses to send anything if another window covers the spot it would tap.
 - **`open <App Name>` uses Spotlight**, since bundle IDs and URLs don't apply.
 - **`type` and `fill` paste through the Mac clipboard** so iOS autocorrect can't change the words. Your clipboard keeps the typed text afterwards. Add `--keystrokes` to type key by key instead.
-- **`press home`, `switcher` and `spotlight`** use iPhone Mirroring's own shortcuts. `lock`, `apps`, `install`, `close` and `boot` are simulator-only.
+- **`press home`, `switcher` and `spotlight`** use iPhone Mirroring's own shortcuts. `lock`, `apps`, `install`, `close`, `boot`, `reload`, `check`, `dialog`, `set`, `push`, `state`, `keychain`, `media`, `clipboard`, `logs`, `audit` and `record` are simulator-only.
 - **If the phone is in use or the session has paused**, commands stop with the message Mirroring shows. `connect` presses Connect for you when it's offered.
 
 ## With an agent

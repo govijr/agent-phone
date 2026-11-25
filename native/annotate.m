@@ -128,3 +128,87 @@ double ap_image_width(const char *path) {
     return w;
   }
 }
+
+static uint8_t *rgba_pixels(const char *path, size_t *w, size_t *h) {
+  CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:@(path)], NULL);
+  if (!source) {
+    return NULL;
+  }
+  CGImageRef image = CGImageSourceCreateImageAtIndex(source, 0, NULL);
+  CFRelease(source);
+  if (!image) {
+    return NULL;
+  }
+  *w = CGImageGetWidth(image);
+  *h = CGImageGetHeight(image);
+  uint8_t *pixels = calloc(*w * *h, 4);
+  CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+  CGContextRef ctx = CGBitmapContextCreate(pixels, *w, *h, 8, *w * 4, space, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+  CGColorSpaceRelease(space);
+  CGContextDrawImage(ctx, CGRectMake(0, 0, *w, *h), image);
+  CGContextRelease(ctx);
+  CGImageRelease(image);
+  return pixels;
+}
+
+// Compares two PNGs pixel by pixel. Writes `out_path` (if given): the second image faded, with
+// changed pixels in red. Sets `ratio` to the share of pixels that changed.
+int ap_image_diff(const char *a_path, const char *b_path, const char *out_path, int threshold, double *ratio, char **err) {
+  @autoreleasepool {
+    size_t aw, ah, bw, bh;
+    uint8_t *a = rgba_pixels(a_path, &aw, &ah);
+    uint8_t *b = rgba_pixels(b_path, &bw, &bh);
+    if (!a || !b) {
+      free(a);
+      free(b);
+      annotate_err(err, [NSString stringWithFormat:@"could not read %s", a ? b_path : a_path]);
+      return 1;
+    }
+    if (aw != bw || ah != bh) {
+      free(a);
+      free(b);
+      annotate_err(err, [NSString stringWithFormat:@"the images differ in size (%zux%zu and %zux%zu)", aw, ah, bw, bh]);
+      return 1;
+    }
+    size_t changed = 0, n = aw * ah;
+    for (size_t i = 0; i < n; i++) {
+      uint8_t *pa = a + i * 4, *pb = b + i * 4;
+      int d = 0;
+      for (int c = 0; c < 3; c++) {
+        d = MAX(d, abs((int)pa[c] - (int)pb[c]));
+      }
+      if (d > threshold) {
+        changed++;
+        pb[0] = 255, pb[1] = 30, pb[2] = 60, pb[3] = 255;
+      } else {
+        for (int c = 0; c < 3; c++) {
+          pb[c] = (uint8_t)(255 - (255 - pb[c]) / 4);
+        }
+      }
+    }
+    *ratio = n ? (double)changed / (double)n : 0;
+    free(a);
+    int status = 0;
+    if (out_path && *out_path) {
+      CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+      CGContextRef ctx = CGBitmapContextCreate(b, bw, bh, 8, bw * 4, space, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+      CGColorSpaceRelease(space);
+      CGImageRef result = CGBitmapContextCreateImage(ctx);
+      CGContextRelease(ctx);
+      CGImageDestinationRef dest = CGImageDestinationCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:@(out_path)], CFSTR("public.png"), 1, NULL);
+      if (dest) {
+        CGImageDestinationAddImage(dest, result, NULL);
+        status = CGImageDestinationFinalize(dest) ? 0 : 1;
+        CFRelease(dest);
+      } else {
+        status = 1;
+      }
+      CGImageRelease(result);
+      if (status) {
+        annotate_err(err, [NSString stringWithFormat:@"could not write %s", out_path]);
+      }
+    }
+    free(b);
+    return status;
+  }
+}

@@ -130,9 +130,27 @@ pub fn screenshot(udid: &str, path: &str) -> Result<()> {
     Ok(())
 }
 
+/// pbcopy and pbpaste (on the Mac and in simctl) read and write text in the encoding named by
+/// `__CF_USER_TEXT_ENCODING`, which is often Mac Roman. Ask for UTF-8 so accents survive.
+pub fn utf8(command: &mut Command) -> &mut Command {
+    let uid = std::env::var("__CF_USER_TEXT_ENCODING")
+        .ok()
+        .and_then(|v| v.split(':').next().map(String::from))
+        .unwrap_or_else(|| "0x1F5".into());
+    command.env("__CF_USER_TEXT_ENCODING", format!("{uid}:0x8000100:0x8000100"))
+}
+
+pub fn pasteboard(udid: &str) -> Result<String> {
+    let out = utf8(Command::new("xcrun").args(["simctl", "pbpaste", udid])).output().context("could not run simctl pbpaste")?;
+    if !out.status.success() {
+        bail!("simctl pbpaste failed");
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 pub fn set_pasteboard(udid: &str, text: &str) -> Result<()> {
     use std::io::Write;
-    let mut child = Command::new("xcrun")
+    let mut child = utf8(&mut Command::new("xcrun"))
         .args(["simctl", "pbcopy", udid])
         .stdin(std::process::Stdio::piped())
         .spawn()
@@ -149,6 +167,8 @@ pub struct App {
     pub bundle_id: String,
     pub name: String,
     pub user: bool,
+    #[serde(skip)]
+    pub executable: Option<String>,
 }
 
 /// Installed apps, user apps first.
@@ -177,14 +197,15 @@ pub fn apps(udid: &str) -> Result<Vec<App>> {
                 .unwrap_or(&bundle_id)
                 .to_string();
             let user = info.get("ApplicationType").and_then(|v| v.as_str()) == Some("User");
-            App { bundle_id, name, user }
+            let executable = info.get("CFBundleExecutable").and_then(|v| v.as_str()).map(String::from);
+            App { bundle_id, name, user, executable }
         })
         .collect();
     apps.sort_by(|a, b| b.user.cmp(&a.user).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
     Ok(apps)
 }
 
-fn simctl(args: &[&str]) -> Result<String> {
+pub fn simctl(args: &[&str]) -> Result<String> {
     let out = Command::new("xcrun")
         .arg("simctl")
         .args(args)

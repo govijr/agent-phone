@@ -120,6 +120,8 @@ fn spawn(key: &str) -> Result<std::process::Child> {
     let child = std::process::Command::new(exe)
         .args(["__daemon", key])
         .env_remove("AGENT_PHONE_DEVICE")
+        .env_remove("AGENT_PHONE_DIALOGS")
+        .env_remove("AGENT_PHONE_NO_DAEMON")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(log)
