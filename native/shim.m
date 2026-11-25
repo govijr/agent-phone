@@ -75,6 +75,7 @@
 - (CGRect)accessibilityFrame;
 - (BOOL)isAccessibilityEnabled;
 - (BOOL)isAccessibilityFocused;
+- (BOOL)isAccessibilitySelected;
 @end
 
 #pragma mark - Errors
@@ -447,6 +448,7 @@ static NSDictionary *describe(id<APPlatformElement> element, int depth) {
       [element respondsToSelector:@selector(accessibilityPlaceholderValue)] ? element.accessibilityPlaceholderValue : nil);
   node[@"enabled"] = @([element respondsToSelector:@selector(isAccessibilityEnabled)] ? element.isAccessibilityEnabled : YES);
   node[@"focused"] = @([element respondsToSelector:@selector(isAccessibilityFocused)] ? element.isAccessibilityFocused : NO);
+  node[@"selected"] = @([element respondsToSelector:@selector(isAccessibilitySelected)] ? element.isAccessibilitySelected : NO);
   CGRect frame = element.accessibilityFrame;
   node[@"frame"] = @[ @(frame.origin.x), @(frame.origin.y), @(frame.size.width), @(frame.size.height) ];
   NSMutableArray *children = [NSMutableArray array];
